@@ -55,6 +55,9 @@ lsy_drone_racing = ["envs/assets/*.xml"]
 [tool.pytest.ini_options]
 markers = ["unit", "integration"]
 
+[tool.ruff.lint.isort]  # Prevent ruff from reporting conflicting settings with isort
+split-on-trailing-comma = false
+
 [tool.ruff]
 # Exclude a variety of commonly ignored directories.
 exclude = [
