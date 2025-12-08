@@ -349,7 +349,7 @@ class RealRaceCoreEnv:
         Note:
             These settings are also required to make the high-level drone commander work properly.
         """
-        # Estimator setting;  1: complementary, 2: kalman -> Manual test: kalman significantly better!
+        # Estimators: 1: complementary, 2: kalman. We recommend kalman based on real-world tests
         self.drone.param.set_value("stabilizer.estimator", 2)
         time.sleep(0.1)  # TODO: Maybe remove
         # enable/disable tumble control. Required 0 for agressive maneuvers
@@ -389,8 +389,7 @@ class RealRaceCoreEnv:
 
         pos = self._ros_connector.pos[self.drone_name]
         vel = self._ros_connector.vel[self.drone_name]
-        # This quick check prevents us from engaging the return controller if we havent even started yet.
-        if pos[2] < 0.2:
+        if pos[2] < 0.2:  # Do not enter the return sequence if we have not taken off
             return
         break_pos = pos + vel / np.linalg.norm(vel) * BREAKING_DISTANCE
         break_pos[2] = RETURN_HEIGHT
