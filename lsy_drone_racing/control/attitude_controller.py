@@ -92,7 +92,12 @@ class AttitudeController(Controller):
 
         des_pos = self._des_pos_spline(t)
         des_vel = self._des_vel_spline(t)
-        des_yaw = 0.0
+
+        des_vel_xy = des_vel[:2]
+        if np.linalg.norm(des_vel_xy) > 1e-3:
+            des_yaw = math.atan2(des_vel_xy[1], des_vel_xy[0])
+        else:
+            des_yaw = 0.0  # or keep previous yaw
 
         # Calculate the deviations from the desired trajectory
         pos_error = des_pos - obs["pos"]
