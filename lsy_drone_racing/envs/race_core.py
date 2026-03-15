@@ -122,9 +122,15 @@ class EnvData:
         """Create a new environment data struct with default values."""
         return cls(
             target_gate=jp.zeros((n_envs, n_drones), dtype=int, device=device),
-            gates_visited=jp.zeros((n_envs, n_drones, n_gates), dtype=bool, device=device),
-            obstacles_visited=jp.zeros((n_envs, n_drones, n_obstacles), dtype=bool, device=device),
-            last_drone_pos=jp.zeros((n_envs, n_drones, 3), dtype=np.float32, device=device),
+            gates_visited=jp.zeros(
+                (n_envs, n_drones, n_gates), dtype=bool, device=device
+            ),
+            obstacles_visited=jp.zeros(
+                (n_envs, n_drones, n_obstacles), dtype=bool, device=device
+            ),
+            last_drone_pos=jp.zeros(
+                (n_envs, n_drones, 3), dtype=np.float32, device=device
+            ),
             marked_for_reset=jp.zeros(n_envs, dtype=bool, device=device),
             disabled_drones=jp.zeros((n_envs, n_drones), dtype=bool, device=device),
             contact_masks=jp.array(contact_masks, dtype=bool, device=device),
@@ -138,7 +144,9 @@ class EnvData:
         )
 
 
-def build_action_space(control_mode: Literal["state", "attitude"], drone_model: str) -> spaces.Box:
+def build_action_space(
+    control_mode: Literal["state", "attitude"], drone_model: str
+) -> spaces.Box:
     """Create the action space for the environment.
 
     Args:
@@ -155,7 +163,9 @@ def build_action_space(control_mode: Literal["state", "attitude"], drone_model: 
         params = ForceTorqueParams.load(drone_model)
         thrust_min, thrust_max = params.thrust_min * 4, params.thrust_max * 4
         return spaces.Box(
-            np.array([-np.pi / 2, -np.pi / 2, -np.pi / 2, thrust_min], dtype=np.float32),
+            np.array(
+                [-np.pi / 2, -np.pi / 2, -np.pi / 2, thrust_min], dtype=np.float32
+            ),
             np.array([np.pi / 2, np.pi / 2, np.pi / 2, thrust_max], dtype=np.float32),
         )
     else:
@@ -182,7 +192,9 @@ def build_observation_space(n_gates: int, n_obstacles: int) -> spaces.Dict:
         "gates_quat": spaces.Box(low=-1, high=1, shape=(n_gates, 4)),
         "gates_visited": spaces.Box(low=0, high=1, shape=(n_gates,), dtype=bool),
         "obstacles_pos": spaces.Box(low=-np.inf, high=np.inf, shape=(n_obstacles, 3)),
-        "obstacles_visited": spaces.Box(low=0, high=1, shape=(n_obstacles,), dtype=bool),
+        "obstacles_visited": spaces.Box(
+            low=0, high=1, shape=(n_obstacles,), dtype=bool
+        ),
     }
     return spaces.Dict(obs_spec)
 
@@ -267,7 +279,9 @@ class RaceCoreEnv:
         """
         super().__init__()
         if type(seed) is str:
-            seed: int = np.random.SeedSequence().entropy if seed == "random" else hash(seed)
+            seed: int = (
+                np.random.SeedSequence().entropy if seed == "random" else hash(seed)
+            )
             seed &= 0xFFFFFFFF  # Limit seed to 32 bit for jax.random
         self.sim = Sim(
             n_worlds=n_envs,
@@ -314,7 +328,9 @@ class RaceCoreEnv:
         contact_masks = self._load_contact_masks(self.sim)
         m = self.sim.mj_model
         gate_ids = [int(m.body(f"gate:{i}").mocapid.squeeze()) for i in range(n_gates)]
-        obstacle_ids = [int(m.body(f"obstacle:{i}").mocapid.squeeze()) for i in range(n_obstacles)]
+        obstacle_ids = [
+            int(m.body(f"obstacle:{i}").mocapid.squeeze()) for i in range(n_obstacles)
+        ]
         self.data = EnvData.create(
             n_envs=n_envs,
             n_drones=n_drones,
@@ -329,10 +345,16 @@ class RaceCoreEnv:
             pos_limit_high=[3, 3, 2.5],
             device=self.device,
         )
-        self.randomize_track = build_track_randomization_fn(randomizations, gate_ids, obstacle_ids)
+        self.randomize_track = build_track_randomization_fn(
+            randomizations, gate_ids, obstacle_ids
+        )
 
     def _reset(
-        self, *, seed: int | None = None, options: dict | None = None, mask: Array | None = None
+        self,
+        *,
+        seed: int | None = None,
+        options: dict | None = None,
+        mask: Array | None = None,
     ) -> tuple[dict[str, Array], dict]:
         """Reset the environment.
 
@@ -352,10 +374,16 @@ class RaceCoreEnv:
         self.sim.reset(mask=mask)
         key, subkey, subkey2 = jax.random.split(self.sim.data.core.rng_key, 3)
         # Generate random track
-        track = generate_random_track(self.track, subkey2) if self.track.randomize else self.track
+        track = (
+            generate_random_track(self.track, subkey2)
+            if self.track.randomize
+            else self.track
+        )
         self.gates, self.obstacles, self.drone = load_track(track)
         # Randomize the track
-        self.sim.data = self.sim.data.replace(core=self.sim.data.core.replace(rng_key=key))
+        self.sim.data = self.sim.data.replace(
+            core=self.sim.data.core.replace(rng_key=key)
+        )
 
         @jax.jit
         def update_sim_data(
@@ -375,7 +403,9 @@ class RaceCoreEnv:
             )
             return data, mjx_data
 
-        self.sim.data, self.sim.mjx_data = update_sim_data(self.sim.data, self.sim.mjx_data, subkey)
+        self.sim.data, self.sim.mjx_data = update_sim_data(
+            self.sim.data, self.sim.mjx_data, subkey
+        )
 
         # Reset the environment data
         self.data = self._reset_env_data(
@@ -398,11 +428,16 @@ class RaceCoreEnv:
         self.sim.step(self.sim.freq // self.freq)
         # Warp drones that have crashed outside the track to prevent them from interfering with
         # other drones still in the race
-        self.sim.data = self._warp_disabled_drones(self.sim.data, self.data.disabled_drones)
+        self.sim.data = self._warp_disabled_drones(
+            self.sim.data, self.data.disabled_drones
+        )
         # Apply the environment logic. Check which drones are now disabled, check which gates have
         # been passed, and update the target gate.
         drone_pos = self.sim.data.states.pos
-        mocap_pos, mocap_quat = self.sim.mjx_data.mocap_pos, self.sim.mjx_data.mocap_quat
+        mocap_pos, mocap_quat = (
+            self.sim.mjx_data.mocap_pos,
+            self.sim.mjx_data.mocap_quat,
+        )
         contacts = self.sim.contacts()
         # Get marked_for_reset before it is updated, because the autoreset needs to be based on the
         # previous flags, not the ones from the current step
@@ -414,7 +449,13 @@ class RaceCoreEnv:
         # Auto-reset envs. Add configuration option to disable for single-world envs
         if self.autoreset and marked_for_reset.any():
             self._reset(mask=marked_for_reset)
-        return self.obs(), self.reward(), self.terminated(), self.truncated(), self.info()
+        return (
+            self.obs(),
+            self.reward(),
+            self.terminated(),
+            self.truncated(),
+            self.info(),
+        )
 
     def apply_action(self, action: Array):
         """Apply the commanded state action to the simulation."""
@@ -423,11 +464,15 @@ class RaceCoreEnv:
         # Tracking issue:
         # https://github.com/jax-ml/jax/issues/29810
         # Forcing a copy here is less efficient, but avoids the warning.
-        action = np.reshape(action, (self.sim.n_worlds, self.sim.n_drones, -1), copy=True)
+        action = np.reshape(
+            action, (self.sim.n_worlds, self.sim.n_drones, -1), copy=True
+        )
         if "action" in self.disturbances:
             key, subkey = jax.random.split(self.sim.data.core.rng_key)
             action += self.disturbances["action"](subkey, action.shape)
-            self.sim.data = self.sim.data.replace(core=self.sim.data.core.replace(rng_key=key))
+            self.sim.data = self.sim.data.replace(
+                core=self.sim.data.core.replace(rng_key=key)
+            )
         match self.sim.control:
             case "attitude":
                 self.sim.attitude_control(action)
@@ -496,7 +541,9 @@ class RaceCoreEnv:
 
     def truncated(self) -> Array:
         """Array of booleans indicating if the episode is truncated."""
-        return self._truncated(self.data.steps, self.data.max_episode_steps, self.sim.n_drones)
+        return self._truncated(
+            self.data.steps, self.data.max_episode_steps, self.sim.n_drones
+        )
 
     def info(self) -> dict:
         """Return an info dictionary containing additional information about the environment."""
@@ -522,7 +569,9 @@ class RaceCoreEnv:
         gates_pos = mocap_pos[:, data.gate_mj_ids]
         dpos = drone_pos[..., None, :2] - gates_pos[:, None, :, :2]
         gates_visited = jp.linalg.norm(dpos, axis=-1) < data.sensor_range
-        gates_visited = jp.where(mask[..., None, None], gates_visited, data.gates_visited)
+        gates_visited = jp.where(
+            mask[..., None, None], gates_visited, data.gates_visited
+        )
         # And which obstacles are in range
         obstacles_pos = mocap_pos[:, data.obstacle_mj_ids]
         dpos = drone_pos[..., None, :2] - obstacles_pos[:, None, :, :2]
@@ -537,7 +586,9 @@ class RaceCoreEnv:
             gates_visited=gates_visited,
             obstacles_visited=obstacles_visited,
             steps=steps,
-            marked_for_reset=jp.where(mask, 0, data.marked_for_reset),  # Unmark after env reset
+            marked_for_reset=jp.where(
+                mask, 0, data.marked_for_reset
+            ),  # Unmark after env reset
         )
 
     @staticmethod
@@ -552,8 +603,12 @@ class RaceCoreEnv:
     ) -> EnvData:
         """Step the environment data."""
         n_gates = len(data.gate_mj_ids)
-        taken_off_drones = (data.steps > freq // 5)[:, None]  # Only activate check after 0.2s
-        disabled_drones = taken_off_drones & RaceCoreEnv._disabled_drones(drone_pos, contacts, data)
+        taken_off_drones = (data.steps > freq // 5)[
+            :, None
+        ]  # Only activate check after 0.2s
+        disabled_drones = taken_off_drones & RaceCoreEnv._disabled_drones(
+            drone_pos, contacts, data
+        )
         gates_pos = mocap_pos[:, data.gate_mj_ids]
         obstacles_pos = mocap_pos[:, data.obstacle_mj_ids]
         # We need to convert the mocap quat from MuJoCo order to scipy order
@@ -563,7 +618,9 @@ class RaceCoreEnv:
         gate_ids = data.gate_mj_ids[data.target_gate % n_gates]
         gate_pos = gates_pos[jp.arange(gates_pos.shape[0])[:, None], gate_ids]
         gate_quat = gates_quat[jp.arange(gates_quat.shape[0])[:, None], gate_ids]
-        passed = gate_passed(drone_pos, data.last_drone_pos, gate_pos, gate_quat, (0.45, 0.45))
+        passed = gate_passed(
+            drone_pos, data.last_drone_pos, gate_pos, gate_quat, (0.45, 0.45)
+        )
         # Update the target gate index. Increment by one if drones have passed a gate
         target_gate = data.target_gate + passed * ~disabled_drones
         target_gate = jp.where(target_gate >= n_gates, -1, target_gate)
@@ -573,9 +630,13 @@ class RaceCoreEnv:
         # Update which gates and obstacles are or have been in range of the drone
         sensor_range = data.sensor_range
         dpos = drone_pos[..., None, :2] - gates_pos[:, None, :, :2]
-        gates_visited = data.gates_visited | (jp.linalg.norm(dpos, axis=-1) < sensor_range)
+        gates_visited = data.gates_visited | (
+            jp.linalg.norm(dpos, axis=-1) < sensor_range
+        )
         dpos = drone_pos[..., None, :2] - obstacles_pos[:, None, :, :2]
-        obstacles_visited = data.obstacles_visited | (jp.linalg.norm(dpos, axis=-1) < sensor_range)
+        obstacles_visited = data.obstacles_visited | (
+            jp.linalg.norm(dpos, axis=-1) < sensor_range
+        )
         data = data.replace(
             last_drone_pos=drone_pos,
             target_gate=target_gate,
@@ -606,7 +667,9 @@ class RaceCoreEnv:
         gates_pos = jp.where(mask, real_pos[:, None], nominal_gate_pos[None, None])
         gates_quat = jp.where(mask, real_quat[:, None], nominal_gate_quat[None, None])
         mask, real_pos = obstacles_visited[..., None], mocap_pos[:, obstacle_mocap_ids]
-        obstacles_pos = jp.where(mask, real_pos[:, None], nominal_obstacle_pos[None, None])
+        obstacles_pos = jp.where(
+            mask, real_pos[:, None], nominal_obstacle_pos[None, None]
+        )
         return gates_pos, gates_quat, obstacles_pos
 
     @staticmethod
@@ -640,16 +703,24 @@ class RaceCoreEnv:
         quat = self.sim.data.states.quat.at[...].set(self.drone["quat"])
         vel = self.sim.data.states.vel.at[...].set(self.drone["vel"])
         ang_vel = self.sim.data.states.ang_vel.at[...].set(self.drone["ang_vel"])
-        states = self.sim.data.states.replace(pos=pos, quat=quat, vel=vel, ang_vel=ang_vel)
+        states = self.sim.data.states.replace(
+            pos=pos, quat=quat, vel=vel, ang_vel=ang_vel
+        )
         self.sim.data = self.sim.data.replace(states=states)
         self.sim.build_default_data()
         # Build the reset randomizations and disturbances into the sim itself
-        self.sim.reset_pipeline = self.sim.reset_pipeline + (build_reset_fn(randomizations),)
+        self.sim.reset_pipeline = self.sim.reset_pipeline + (
+            build_reset_fn(randomizations),
+        )
         self.sim.build_reset_fn()
         if "dynamics" in self.disturbances:
-            disturbance_fn = build_dynamics_disturbance_fn(self.disturbances["dynamics"])
+            disturbance_fn = build_dynamics_disturbance_fn(
+                self.disturbances["dynamics"]
+            )
             self.sim.step_pipeline = (
-                self.sim.step_pipeline[:2] + (disturbance_fn,) + self.sim.step_pipeline[2:]
+                self.sim.step_pipeline[:2]
+                + (disturbance_fn,)
+                + self.sim.step_pipeline[2:]
             )
             self.sim.build_step_fn()
 
@@ -665,7 +736,9 @@ class RaceCoreEnv:
             gate.pos = self.gates["pos"][i]
             # Convert from scipy order to MuJoCo order
             gate.quat = self.gates["quat"][i][[3, 0, 1, 2]]
-            gate.mocap = True  # Make mocap to modify the position of static bodies during sim
+            gate.mocap = (
+                True  # Make mocap to modify the position of static bodies during sim
+            )
         for i in range(n_obstacles):
             obstacle_body = obstacle_spec.body("obstacle")
             if obstacle_body is None:
@@ -704,7 +777,9 @@ class RaceCoreEnv:
 
 def rng_spec2fn(fn_spec: dict) -> Callable:
     """Convert a function spec to a wrapped and scaled function from jax.random."""
-    offset, scale = np.array(fn_spec.get("offset", 0)), np.array(fn_spec.get("scale", 1))
+    offset, scale = np.array(fn_spec.get("offset", 0)), np.array(
+        fn_spec.get("scale", 1)
+    )
     kwargs = fn_spec.get("kwargs", {})
     if "shape" in kwargs:
         raise KeyError("Shape must not be specified for randomization functions.")
@@ -755,7 +830,9 @@ def build_track_randomization_fn(
             case "gate_rpy":
                 randomization_fns += (randomize_gate_rpy_fn(rng, gate_mocap_ids),)
             case "obstacle_pos":
-                randomization_fns += (randomize_obstacle_pos_fn(rng, obstacle_mocap_ids),)
+                randomization_fns += (
+                    randomize_obstacle_pos_fn(rng, obstacle_mocap_ids),
+                )
             case "drone_pos" | "drone_rpy" | "drone_mass" | "drone_inertia":
                 pass
             case _:
@@ -770,11 +847,17 @@ def build_track_randomization_fn(
         nominal_obstacle_pos: Array,
         key: jax.random.PRNGKey,
     ) -> Data:
-        gate_quat = jp.roll(nominal_gate_quat, 1, axis=-1)  # Convert from scipy to MuJoCo order
+        gate_quat = jp.roll(
+            nominal_gate_quat, 1, axis=-1
+        )  # Convert from scipy to MuJoCo order
 
         # Reset to default track positions first
-        data = data.replace(mocap_pos=data.mocap_pos.at[:, gate_mocap_ids].set(nominal_gate_pos))
-        data = data.replace(mocap_quat=data.mocap_quat.at[:, gate_mocap_ids].set(gate_quat))
+        data = data.replace(
+            mocap_pos=data.mocap_pos.at[:, gate_mocap_ids].set(nominal_gate_pos)
+        )
+        data = data.replace(
+            mocap_quat=data.mocap_quat.at[:, gate_mocap_ids].set(gate_quat)
+        )
         data = data.replace(
             mocap_pos=data.mocap_pos.at[:, obstacle_mocap_ids].set(nominal_obstacle_pos)
         )

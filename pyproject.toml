@@ -176,7 +176,7 @@ gpu-tests = { features = ["sim", "gpu", "tests"], solve-group = "default" }
 [tool.pixi.dependencies]
 openblas = ">=0.3.30,<0.4"
 ruff = "*"
-python = ">=3.11.12,<3.14"
+python = "3.12.*"
 pip = ">=25.0.1,<26"
 cmake = "*"
 compilers = ">=1.9.0, <1.11.0"

@@ -1,4 +1,5 @@
 # Autonomous Drone Racing Project Course
+
 <p align="center">
   <img width="460" height="300" src="docs/img/banner.jpeg">
 </p>
@@ -6,17 +7,14 @@
 
 [![Python Version]][Python Version URL] [![Ruff Check]][Ruff Check URL] [![Documentation Status]][Documentation Status URL] [![Tests]][Tests URL]
 
-[Python Version]: https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue  
-[Python Version URL]: https://www.python.org  
-
-[Ruff Check]: https://github.com/utiasDSL/lsy_drone_racing/actions/workflows/ruff.yml/badge.svg?style=flat-square  
-[Ruff Check URL]: https://github.com/utiasDSL/lsy_drone_racing/actions/workflows/ruff.yml  
-
-[Documentation Status]: https://readthedocs.org/projects/lsy-drone-racing/badge/?version=latest  
-[Documentation Status URL]: https://lsy-drone-racing.readthedocs.io/en/latest/?badge=latest  
-
-[Tests]: https://github.com/utiasDSL/lsy_drone_racing/actions/workflows/testing.yml/badge.svg  
-[Tests URL]: https://github.com/utiasDSL/lsy_drone_racing/actions/workflows/testing.yml  
+[Python Version]: https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue
+[Python Version URL]: https://www.python.org
+[Ruff Check]: https://github.com/utiasDSL/lsy_drone_racing/actions/workflows/ruff.yml/badge.svg?style=flat-square
+[Ruff Check URL]: https://github.com/utiasDSL/lsy_drone_racing/actions/workflows/ruff.yml
+[Documentation Status]: https://readthedocs.org/projects/lsy-drone-racing/badge/?version=latest
+[Documentation Status URL]: https://lsy-drone-racing.readthedocs.io/en/latest/?badge=latest
+[Tests]: https://github.com/utiasDSL/lsy_drone_racing/actions/workflows/testing.yml/badge.svg
+[Tests URL]: https://github.com/utiasDSL/lsy_drone_racing/actions/workflows/testing.yml
 
 ---
 
@@ -38,9 +36,9 @@ To get started, visit our [official documentation](https://lsy-drone-racing.read
 This project builds upon several open-source packages developed by the [Learning Systems Lab (LSY)](https://www.ce.cit.tum.de/lsy/home/) at TUM.  
 You can explore these related projects:
 
-- [**crazyflow**](https://github.com/utiasDSL/crazyflow) – A high-speed, high-fidelity drone simulator with strong sim-to-real performance.  
-- [**drone-models**](https://github.com/utiasDSL/drone-models) – A collection of accurate drone models for simulation and model-based control.  
-- [**drone-controllers**](https://github.com/utiasDSL/drone-controllers) – Controllers for the Crazyflie quadrotor.  
+- [**crazyflow**](https://github.com/utiasDSL/crazyflow) – A high-speed, high-fidelity drone simulator with strong sim-to-real performance.
+- [**drone-models**](https://github.com/utiasDSL/drone-models) – A collection of accurate drone models for simulation and model-based control.
+- [**drone-controllers**](https://github.com/utiasDSL/drone-controllers) – Controllers for the Crazyflie quadrotor.
 
 ---
 
@@ -51,9 +49,9 @@ The configuration files specify progressive difficulty levels from easy (0) to h
 
 |      Evaluation Scenario      | Rand. Inertial Properties | Randomized Obstacles, Gates | Random Tracks |             Notes              |
 | :---------------------------: | :-----------------------: | :-------------------------: | :-----------: | :----------------------------: |
-| [Level 0](config/level0.toml) |           *No*            |            *No*             |     *No*      |       Perfect knowledge        |
-| [Level 1](config/level1.toml) |          **Yes**          |            *No*             |     *No*      |        Adaptive control        |
-| [Level 2](config/level2.toml) |          **Yes**          |           **Yes**           |     *No*      |          Re-planning           |
+| [Level 0](config/level0.toml) |           _No_            |            _No_             |     _No_      |       Perfect knowledge        |
+| [Level 1](config/level1.toml) |          **Yes**          |            _No_             |     _No_      |        Adaptive control        |
+| [Level 2](config/level2.toml) |          **Yes**          |           **Yes**           |     _No_      |          Re-planning           |
 | [Level 3](config/level3.toml) |          **Yes**          |           **Yes**           |    **Yes**    |        Online planning         |
 |         **sim2real**          |     **Real hardware**     |           **Yes**           |    **Yes**    | Simulation-to-reality transfer |
 
@@ -72,3 +70,13 @@ If your code fails the automated tests, it is likely to encounter the same issue
 For full details, refer to the [documentation](https://lsy-drone-racing.readthedocs.io/en/latest/).
 
 ---
+
+# Packages
+
+# Orb Slam
+
+# Usually requires running a bash script or standard CMake
+
+mkdir build && cd build
+cmake ..
+make -j4
