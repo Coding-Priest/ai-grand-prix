@@ -650,6 +650,7 @@ dependencies = [
     { name = "jax", extra = ["cuda12"] },
     { name = "numpy" },
     { name = "opencv-python" },
+    { name = "orbslam3" },
     { name = "toml" },
     { name = "torch" },
     { name = "warp-lang" },
@@ -688,6 +689,7 @@ requires-dist = [
     { name = "ml-collections", marker = "extra == 'sim'", specifier = ">=1.0" },
     { name = "numpy" },
     { name = "opencv-python", specifier = ">=4.13.0.92" },
+    { name = "orbslam3", git = "https://github.com/Robaire/orbslam3-python.git" },
     { name = "packaging", marker = "extra == 'sim'", specifier = ">=24.0" },
     { name = "toml", specifier = ">=0.10.2" },
     { name = "torch", specifier = ">=2.10.0" },
@@ -1266,6 +1268,14 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/1c/c8/ed7ac3c3c687bf129d7469b016c2b3d8777379f4ea453474e50ee41ce5cb/orbax_export-0.0.8.tar.gz", hash = "sha256:544eef564e2a6f17cd11b1167febe348b7b7cf56d9575de994a33d5613dd568a", size = 124980, upload-time = "2025-09-17T15:41:14.264Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/7f/a9/3a755a58c8b6a36fe7e9e66bb6b93967ff49cdbc77cca8eacb2cf66435e9/orbax_export-0.0.8-py3-none-any.whl", hash = "sha256:f8037e1666ad28411cdb08d0668a2737b1281a32902c623ceda12109a089bc36", size = 180487, upload-time = "2025-09-17T15:41:12.928Z" },
+]
+
+[[package]]
+name = "orbslam3"
+version = "0.0.1"
+source = { git = "https://github.com/Robaire/orbslam3-python.git#6f272d847fd4b031805a16cea64162d579e54986" }
+dependencies = [
+    { name = "numpy" },
 ]
 
 [[package]]
