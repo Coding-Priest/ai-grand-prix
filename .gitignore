@@ -13,8 +13,11 @@ plots/
 c_generated_code/
 /build
 
+# uv
+.venv/
+
 # pixi environments
-.pixi/*
+.pixi/
 !.pixi/config.toml
 ros_ws/
 acados/
