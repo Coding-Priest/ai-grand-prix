@@ -20,3 +20,4 @@ ros_ws/
 acados/
 wandb/
 models/
+lsy_drone_racing/control/checkpoints
