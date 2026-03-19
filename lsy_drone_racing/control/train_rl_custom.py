@@ -256,7 +256,7 @@ class RaceTrainEnv(VecDroneRaceEnv):
         drone_vel = self.sim.data.states.vel[:, 0, :]  # (N, 3)  from state — no prev needed
         to_gate = gate_pos - drone_pos
         dist = jp.linalg.norm(to_gate, axis=-1, keepdims=True).clip(1e-6)
-        progress = jp.sum(drone_vel * (to_gate / dist), axis=-1, keepdims=True)  # (N, 1) sus
+        progress = jp.sum(drone_vel * (to_gate / dist), axis=-1, keepdims=False)  # (N, 1) sus
 
         # Detect gate pass: target gate incremented OR reached end (target_gate == -1)
         passed = (self.data.target_gate > self.prev_target_gate) | (
@@ -444,6 +444,7 @@ class VecNormalize(VectorWrapper):
         cliprew=10.0,
         gamma=0.99,
         epsilon=1e-8,
+        training=True,
     ):
         """Init."""
         super().__init__(venv)
@@ -454,16 +455,21 @@ class VecNormalize(VectorWrapper):
         self.ret = jp.zeros(self.num_envs)
         self.gamma = gamma
         self.epsilon = epsilon
+        self.training = training
 
     def step(self, actions):
         """Override step."""
         obs, rews, terminations, truncations, infos = self.env.step(actions)
         dones = terminations | truncations
 
+        # Store raw rewards before normalization
+        infos["reward_raw"] = rews
+
         self.ret = self.ret * self.gamma + rews
         obs = self._obfilt(obs)
         if self.ret_rms:
-            self.ret_rms.update(self.ret)
+            if self.training:
+                self.ret_rms.update(self.ret)
             rews = jp.clip(
                 rews / jp.sqrt(self.ret_rms.var + self.epsilon), -self.cliprew, self.cliprew
             )
@@ -473,7 +479,8 @@ class VecNormalize(VectorWrapper):
     def _obfilt(self, obs):
         """Filter observations."""
         if self.ob_rms:
-            self.ob_rms.update(obs)
+            if self.training:
+                self.ob_rms.update(obs)
             obs = jp.clip(
                 (obs - self.ob_rms.mean) / jp.sqrt(self.ob_rms.var + self.epsilon),
                 -self.clipob,
@@ -488,6 +495,38 @@ class VecNormalize(VectorWrapper):
         obs, info = self.env.reset(**kwargs)
         self.ret = jp.zeros(self.num_envs)
         return self._obfilt(obs), info
+
+    def get_stats(self):
+        """Get statistics."""
+        return {
+            "ob_rms_mean": self.ob_rms.mean if self.ob_rms else None,
+            "ob_rms_var": self.ob_rms.var if self.ob_rms else None,
+            "ob_rms_count": self.ob_rms.count if self.ob_rms else None,
+            "ret_rms_mean": self.ret_rms.mean if self.ret_rms else None,
+            "ret_rms_var": self.ret_rms.var if self.ret_rms else None,
+            "ret_rms_count": self.ret_rms.count if self.ret_rms else None,
+        }
+
+    def set_stats(self, stats):
+        """Set statistics."""
+        if self.ob_rms and stats.get("ob_rms_mean") is not None:
+            self.ob_rms.mean = jp.array(stats["ob_rms_mean"])
+            self.ob_rms.var = jp.array(stats["ob_rms_var"])
+            self.ob_rms.count = stats["ob_rms_count"]
+        if self.ret_rms and stats.get("ret_rms_mean") is not None:
+            self.ret_rms.mean = jp.array(stats["ret_rms_mean"])
+            self.ret_rms.var = jp.array(stats["ret_rms_var"])
+            self.ret_rms.count = stats["ret_rms_count"]
+
+
+def get_vec_normalize(env: VectorEnv) -> VecNormalize | None:
+    """Find VecNormalize wrapper in the environment stack."""
+    while hasattr(env, "env"):
+        if isinstance(env, VecNormalize):
+            return env
+        env = env.env
+    return None
+
 
 class GlobalRewardScale(VectorRewardWrapper):
     """Scales the final accumulated reward from the base env and all prior wrappers."""
@@ -543,9 +582,9 @@ def make_envs(
         d_act_xy_coef=coefs.get("d_act_xy_coef", 1.0),
     )
 
-    env = GlobalRewardScale(env, scale=coefs.get("global_scale", 0.01))
+    # env = GlobalRewardScale(env, scale=coefs.get("global_scale", 0.01))
     env = FlattenJaxObservation(env)
-    env = VecNormalize(env)
+    env = VecNormalize(env, training=coefs.get("training", True))
     env = JaxToTorch(env, torch_device)
     return env
 
@@ -634,6 +673,8 @@ def train_ppo(
     envs = make_envs(
         num_envs=args.num_envs, jax_device=jax_device, torch_device=device, coefs=r_coefs
     )
+    vec_norm = get_vec_normalize(envs)
+
     assert isinstance(envs.single_action_space, gym.spaces.Box), (
         "only continuous action space is supported"
     )
@@ -658,6 +699,8 @@ def train_ppo(
             checkpoint = torch.load(latest_checkpoint, map_location=device, weights_only=False)
             agent.load_state_dict(checkpoint["agent_state_dict"])
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            if vec_norm and "vec_normalize_stats" in checkpoint:
+                vec_norm.set_stats(checkpoint["vec_normalize_stats"])
             global_step = checkpoint["global_step"]
             start_iteration = checkpoint["iteration"] + 1
             best_mean_reward = checkpoint.get("best_mean_reward", -float("inf"))
@@ -682,6 +725,7 @@ def train_ppo(
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
     sum_rewards = torch.zeros((args.num_envs)).to(device)
+    sum_rewards_raw = torch.zeros((args.num_envs)).to(device)
     sum_rewards_hist = []
 
     for iteration in range(start_iteration, args.num_iterations + 1):
@@ -710,11 +754,19 @@ def train_ppo(
             # envs.render()
             rewards[step] = reward
             sum_rewards += reward
+            if "reward_raw" in infos:
+                sum_rewards_raw += torch.as_tensor(infos["reward_raw"]).to(device)
             sum_rewards_hist.extend(sum_rewards[next_done.bool()].tolist())
             if wandb_enabled and next_done.any():
-                for r in sum_rewards[next_done.bool()]:
-                    wandb.log({"train/reward": r.item()}, step=global_step)
+                for r, r_raw in zip(
+                    sum_rewards[next_done.bool()], sum_rewards_raw[next_done.bool()]
+                ):
+                    wandb.log(
+                        {"train/reward": r.item(), "train/reward_raw": r_raw.item()},
+                        step=global_step,
+                    )
             sum_rewards[next_done.bool()] = 0
+            sum_rewards_raw[next_done.bool()] = 0
             next_done = terminations | truncations
 
         # bootstrap value if not done
@@ -831,6 +883,7 @@ def train_ppo(
             state = {
                 "agent_state_dict": agent.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "vec_normalize_stats": vec_norm.get_stats() if vec_norm else None,
                 "iteration": iteration,
                 "global_step": global_step,
                 "best_mean_reward": best_mean_reward,
@@ -866,8 +919,11 @@ def evaluate_ppo(args: Args, n_eval: int) -> tuple[float, float]:
         "d_act_th_coef": args.d_act_th_coef,
         "act_coef": args.act_coef,
         "look_at_coef": args.look_at_coef,
+        "training": False,
     }
     eval_env = make_envs(num_envs=1, coefs=r_coefs)
+    vec_norm = get_vec_normalize(eval_env)
+
     agent = Agent(eval_env.single_observation_space.shape, eval_env.single_action_space.shape).to(
         device
     )
@@ -889,6 +945,8 @@ def evaluate_ppo(args: Args, n_eval: int) -> tuple[float, float]:
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     if isinstance(checkpoint, dict) and "agent_state_dict" in checkpoint:
         agent.load_state_dict(checkpoint["agent_state_dict"])
+        if vec_norm and "vec_normalize_stats" in checkpoint:
+            vec_norm.set_stats(checkpoint["vec_normalize_stats"])
     else:
         agent.load_state_dict(checkpoint)
     with torch.no_grad():
@@ -923,7 +981,7 @@ def evaluate_ppo(args: Args, n_eval: int) -> tuple[float, float]:
 # region Main
 def main(
     wandb_enabled: bool = True,
-    train: bool = False,
+    train: bool = True,
     eval: int = 1,
     checkpoint_freq: float = 0.1,
     resume: bool = False,
