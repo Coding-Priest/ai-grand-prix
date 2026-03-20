@@ -102,6 +102,7 @@ class EnvData:
     obstacle_mj_ids: Array
     max_episode_steps: Array
     sensor_range: Array
+    last_drone_vel: Array
 
     @classmethod
     def create(
@@ -118,6 +119,7 @@ class EnvData:
         pos_limit_low: Array,
         pos_limit_high: Array,
         device: Device,
+        last_drone_vel: Array,
     ) -> EnvData:
         """Create a new environment data struct with default values."""
         return cls(
@@ -141,6 +143,10 @@ class EnvData:
             obstacle_mj_ids=jp.array(obstacle_mj_ids, dtype=int, device=device),
             max_episode_steps=jp.array([max_episode_steps], dtype=int, device=device),
             sensor_range=jp.array([sensor_range], dtype=jp.float32, device=device),
+            last_drone_vel=jp.tile(
+                jp.array(last_drone_vel, dtype=np.float32, device=device),
+                (n_envs, n_drones, 1),
+            ),
         )
 
 
@@ -344,10 +350,27 @@ class RaceCoreEnv:
             pos_limit_low=[-3, -3, -1e-3],
             pos_limit_high=[3, 3, 2.5],
             device=self.device,
+            last_drone_vel=self.drone["vel"],
         )
         self.randomize_track = build_track_randomization_fn(
             randomizations, gate_ids, obstacle_ids
         )
+
+    @staticmethod
+    @jax.jit
+    def _rotate_vector(q: Array, v: Array) -> Array:
+        """Rotates a batched vector v by a batched quaternion q (scipy format: x, y, z, w)."""
+        q_xyz = q[..., :3]
+        q_w = q[..., 3:4]  # Keep dimension for broadcasting
+
+        t = 2.0 * jp.cross(q_xyz, v, axis=-1)
+        return v + q_w * t + jp.cross(q_xyz, t, axis=-1)
+
+    @staticmethod
+    @jax.jit
+    def _quat_conjugate(q: Array) -> Array:
+        """Returns the conjugate of a batched quaternion [x, y, z, w]."""
+        return jp.concatenate([-q[..., :3], q[..., 3:4]], axis=-1)
 
     def _reset(
         self,
@@ -409,7 +432,11 @@ class RaceCoreEnv:
 
         # Reset the environment data
         self.data = self._reset_env_data(
-            self.data, self.sim.data.states.pos, self.sim.mjx_data.mocap_pos, mask
+            self.data,
+            self.sim.data.states.pos,
+            self.sim.data.states.vel,
+            self.sim.mjx_data.mocap_pos,
+            mask,
         )
 
         return self.obs(), self.info()
@@ -434,6 +461,7 @@ class RaceCoreEnv:
         # Apply the environment logic. Check which drones are now disabled, check which gates have
         # been passed, and update the target gate.
         drone_pos = self.sim.data.states.pos
+        drone_vel = self.sim.data.states.vel
         mocap_pos, mocap_quat = (
             self.sim.mjx_data.mocap_pos,
             self.sim.mjx_data.mocap_quat,
@@ -444,7 +472,13 @@ class RaceCoreEnv:
         marked_for_reset = self.data.marked_for_reset
         # Apply the environment logic with updated simulation data.
         self.data = self._step_env(
-            self.data, drone_pos, mocap_pos, mocap_quat, contacts, self.sim.freq
+            self.data,
+            drone_pos,
+            drone_vel,
+            mocap_pos,
+            mocap_quat,
+            contacts,
+            self.sim.freq,
         )
         # Auto-reset envs. Add configuration option to disable for single-world envs
         if self.autoreset and marked_for_reset.any():
@@ -504,11 +538,24 @@ class RaceCoreEnv:
             self.data.obstacle_mj_ids,
             self.obstacles["nominal_pos"],
         )
+
+        # Calculate IMU values
+        dt = 1.0 / self.freq
+        accel, gyro = self.compute_imu(
+            current_vel=self.sim.data.states.vel,
+            last_vel=self.data.last_drone_vel,
+            current_quat=self.sim.data.states.quat,
+            current_ang_vel=self.sim.data.states.ang_vel,
+            dt=dt,
+        )
+
         obs = {
             "pos": self.sim.data.states.pos,
             "quat": self.sim.data.states.quat,
             "vel": self.sim.data.states.vel,
             "ang_vel": self.sim.data.states.ang_vel,
+            "accel": accel,
+            "gyro": gyro,
             "target_gate": self.data.target_gate,
             "gates_pos": gates_pos,
             "gates_quat": gates_quat,
@@ -557,7 +604,11 @@ class RaceCoreEnv:
     @staticmethod
     @jax.jit
     def _reset_env_data(
-        data: EnvData, drone_pos: Array, mocap_pos: Array, mask: Array | None = None
+        data: EnvData,
+        drone_pos: Array,
+        drone_vel: Array,
+        mocap_pos: Array,
+        mask: Array | None = None,
     ) -> EnvData:
         """Reset auxiliary variables of the environment data."""
         mask = jp.ones(data.steps.shape, dtype=bool) if mask is None else mask
@@ -579,6 +630,8 @@ class RaceCoreEnv:
         obstacles_visited = jp.where(
             mask[..., None, None], obstacles_visited, data.obstacles_visited
         )
+        last_drone_vel = jp.where(mask[..., None, None], drone_vel, data.last_drone_vel)
+
         return data.replace(
             target_gate=target_gate,
             last_drone_pos=last_drone_pos,
@@ -589,6 +642,7 @@ class RaceCoreEnv:
             marked_for_reset=jp.where(
                 mask, 0, data.marked_for_reset
             ),  # Unmark after env reset
+            last_drone_vel=last_drone_vel,
         )
 
     @staticmethod
@@ -596,6 +650,7 @@ class RaceCoreEnv:
     def _step_env(
         data: EnvData,
         drone_pos: Array,
+        drone_vel: Array,
         mocap_pos: Array,
         mocap_quat: Array,
         contacts: Array,
@@ -639,6 +694,7 @@ class RaceCoreEnv:
         )
         data = data.replace(
             last_drone_pos=drone_pos,
+            last_drone_vel=drone_vel,
             target_gate=target_gate,
             disabled_drones=disabled_drones,
             marked_for_reset=marked_for_reset,
@@ -692,6 +748,43 @@ class RaceCoreEnv:
         """Warp the disabled drones below the ground."""
         pos = jax.numpy.where(mask[..., None], -1, data.states.pos)
         return data.replace(states=data.states.replace(pos=pos))
+
+    @staticmethod
+    @jax.jit
+    def compute_imu(
+        current_vel: Array,
+        last_vel: Array,
+        current_quat: Array,
+        current_ang_vel: Array,
+        dt: float,
+    ) -> tuple[Array, Array]:
+        """Calculates accelerometer and gyroscope readings in the body frame.
+
+        Returns:
+            accel_body: Proper acceleration in body frame (m/s^2)
+            gyro_body: Angular velocity in body frame (rad/s)
+        """
+        # --- Accelerometer ---
+        # 1. Kinematic acceleration (World Frame)
+        accel_world = (current_vel - last_vel) / dt
+
+        # 2. Add gravity (World Frame)
+        # To read 9.81 on the Z-axis when resting, we add the gravity vector
+        gravity = jp.array([0.0, 0.0, 9.81])
+        proper_accel_world = accel_world + gravity
+
+        # 3. Rotate to Body Frame
+        # current_quat is Body-to-World. We need World-to-Body, so we use the conjugate.
+        q_inv = RaceCoreEnv._quat_conjugate(current_quat)
+        accel_body = RaceCoreEnv._rotate_vector(q_inv, proper_accel_world)
+
+        # --- Gyroscope ---
+        # NOTE: Check your MuJoCo configuration. If `current_ang_vel` is ALREADY
+        # extracted in the local body frame by your Sim wrapper, you can skip this rotation.
+        # Assuming it is in the World frame:
+        gyro_body = RaceCoreEnv._rotate_vector(q_inv, current_ang_vel)
+
+        return accel_body, gyro_body
 
     def _setup_sim(self, randomizations: dict):
         """Setup the simulation data and build the reset and step functions with custom hooks."""

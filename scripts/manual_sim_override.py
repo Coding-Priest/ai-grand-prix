@@ -10,6 +10,7 @@ Look for instructions in `README.md` and in the official documentation.
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 
 import fire
@@ -27,10 +28,12 @@ logger = logging.getLogger(__name__)
 
 
 def simulate(
-    config: str = "level0.toml",
+    config: str = "level0_keyboard_control.toml",
     controller: str | None = None,
     n_runs: int = 1,
     render: bool | None = None,
+    record: bool = False,
+    record_path: str = "drone_fly.mp4",
 ) -> list[float]:
     """Evaluate the drone controller over multiple episodes.
 
@@ -70,13 +73,9 @@ def simulate(
     )
     env = JaxToNumpy(env)
 
-    fps = 30
-    width, height = 1920, 1080  # Match your env dimensions
-    fourcc = cv.VideoWriter_fourcc(*"mp4v")
-    video_writer = cv.VideoWriter("drone_fly.mp4", fourcc, fps, (width, height))
-
     ep_times = []
-    for _ in range(n_runs):  # Run n_runs episodes with the controller
+    # with SLAMStreamer() as slam:
+    while True:  # Run until stopped
         obs, info = env.reset()
         controller: Controller = controller_cls(obs, info, config)
         i = 0
@@ -101,25 +100,20 @@ def simulate(
                 break
 
             frame = obs["camera_frame"]
-
-            # frame = env.unwrapped.sim
-            bgr_frame = cv.cvtColor(frame, cv.COLOR_RGB2BGR)
-
-            video_writer.write(bgr_frame)
+            gyro = obs["gyro"]
+            accel = obs["accel"]
 
             if config.sim.render:  # Render the sim if selected.
                 if ((i * fps) % config.env.freq) < fps:
                     env.render()
             i += 1
+            time.sleep(1.0 / config.env.freq)  # Throttle to env frequency
 
         controller.episode_callback()  # Update the controller internal state and models.
         log_episode_stats(obs, info, config, curr_time)
         controller.episode_reset()
         ep_times.append(curr_time if obs["target_gate"] == -1 else None)
 
-    video_writer.release()
-    print("Video saved successfully!")
-    # Close the environment
     env.close()
     return ep_times
 

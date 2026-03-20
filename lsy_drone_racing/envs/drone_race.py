@@ -104,8 +104,11 @@ class DroneRaceEnv(RaceCoreEnv, Env):
 
         obs = {k: v[0, 0] for k, v in obs.items()}
         camera_frame = self.sim.render(mode="rgb_array", camera="fpv_cam:0")
+
         # print(camera_frame)
         obs["camera_frame"] = camera_frame
+
+        # obs["gyroscope"] =
 
         info = {k: v[0, 0] for k, v in info.items()}
 

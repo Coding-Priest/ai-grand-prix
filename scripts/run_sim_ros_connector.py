@@ -21,13 +21,14 @@ from gymnasium.wrappers.jax_to_numpy import JaxToNumpy
 from lsy_drone_racing.envs.drone_race import DroneRaceEnv
 from lsy_drone_racing.utils import load_config, load_controller
 
+# from lsy_drone_racing.slam.orb_slam_bridge import OrbSlamBridge
 import cv2 as cv
 
 logger = logging.getLogger(__name__)
 
 
 def simulate(
-    config: str = "level0.toml",
+    config: str = "level0_slam_start.toml",
     controller: str | None = None,
     n_runs: int = 1,
     render: bool | None = None,
@@ -70,10 +71,11 @@ def simulate(
     )
     env = JaxToNumpy(env)
 
-    fps = 30
-    width, height = 1920, 1080  # Match your env dimensions
-    fourcc = cv.VideoWriter_fourcc(*"mp4v")
-    video_writer = cv.VideoWriter("drone_fly.mp4", fourcc, fps, (width, height))
+    # node = OrbSlamBridge()
+    # fps = 30
+    # width, height = 1920, 1080  # Match your env dimensions
+    # fourcc = cv.VideoWriter_fourcc(*"mp4v")
+    # video_writer = cv.VideoWriter("drone_fly.mp4", fourcc, fps, (width, height))
 
     ep_times = []
     for _ in range(n_runs):  # Run n_runs episodes with the controller
@@ -102,11 +104,6 @@ def simulate(
 
             frame = obs["camera_frame"]
 
-            # frame = env.unwrapped.sim
-            bgr_frame = cv.cvtColor(frame, cv.COLOR_RGB2BGR)
-
-            video_writer.write(bgr_frame)
-
             if config.sim.render:  # Render the sim if selected.
                 if ((i * fps) % config.env.freq) < fps:
                     env.render()
@@ -117,8 +114,6 @@ def simulate(
         controller.episode_reset()
         ep_times.append(curr_time if obs["target_gate"] == -1 else None)
 
-    video_writer.release()
-    print("Video saved successfully!")
     # Close the environment
     env.close()
     return ep_times
