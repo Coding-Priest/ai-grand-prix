@@ -70,7 +70,7 @@ class Args:
     """the K epochs to update the policy"""
     norm_adv: bool = True
     """Toggles advantages normalization"""
-    clip_coef: float = 0.26
+    clip_coef: float = 0.20
     """the surrogate clipping coefficient"""
     clip_vloss: bool = True
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
@@ -256,7 +256,7 @@ class RaceTrainEnv(VecDroneRaceEnv):
         drone_vel = self.sim.data.states.vel[:, 0, :]  # (N, 3)  from state — no prev needed
         to_gate = gate_pos - drone_pos
         dist = jp.linalg.norm(to_gate, axis=-1, keepdims=True).clip(1e-6)
-        progress = jp.sum(drone_vel * (to_gate / dist), axis=-1, keepdims=False)  # (N, 1) sus
+        progress = jp.sum(drone_vel * (to_gate / dist), axis=-1, keepdims=False)  # (N,)
 
         # Detect gate pass: target gate incremented OR reached end (target_gate == -1)
         passed = (self.data.target_gate > self.prev_target_gate) | (
@@ -268,7 +268,7 @@ class RaceTrainEnv(VecDroneRaceEnv):
         disabled = self.data.disabled_drones[:, :1]
         is_finished = self.data.target_gate == -1
         # Crash penalty only if disabled but NOT finished
-        return jp.where(disabled & ~is_finished, -100.0, reward)
+        return jp.where(disabled & ~is_finished, -10.0, reward)
 
 
 # region Wrappers
@@ -441,8 +441,8 @@ class VecNormalize(VectorWrapper):
         ob=True,
         ret=True,
         clipob=10.0,
-        cliprew=10.0,
-        gamma=0.99,
+        cliprew=100.0,
+        gamma=0.94,
         epsilon=1e-8,
         training=True,
     ):
@@ -578,13 +578,13 @@ def make_envs(
     env = ActionPenalty(
         env,
         act_coef=coefs.get("act_coef", 0.04),
-        d_act_th_coef=coefs.get("d_act_th_coef", 0.4),
-        d_act_xy_coef=coefs.get("d_act_xy_coef", 1.0),
+        d_act_th_coef=coefs.get("d_act_th_coef", 0.04),
+        d_act_xy_coef=coefs.get("d_act_xy_coef", 0.04),
     )
 
     # env = GlobalRewardScale(env, scale=coefs.get("global_scale", 0.01))
     env = FlattenJaxObservation(env)
-    env = VecNormalize(env, training=coefs.get("training", True))
+    env = VecNormalize(env, training=coefs.get("training", True), gamma=coefs.get("gamma", 0.99),)
     env = JaxToTorch(env, torch_device)
     return env
 
@@ -621,8 +621,11 @@ class Agent(nn.Module):
             layer_init(nn.Linear(64, torch.tensor(action_shape).prod()), std=0.01),
             nn.Tanh(),
         )
+        # self.actor_logstd = nn.Parameter(
+        #     torch.Tensor([[-1, -1, -1, 1]])  # start with smaller std for roll, pitch, yaw
+        # )
         self.actor_logstd = nn.Parameter(
-            torch.Tensor([[-1, -1, -1, 1]])  # start with smaller std for roll, pitch, yaw
+            torch.zeros(1, torch.tensor(action_shape).prod()) 
         )
 
     def get_value(self, x: Tensor) -> Tensor:
@@ -669,6 +672,7 @@ def train_ppo(
         "act_coef": args.act_coef,
         "look_at_coef": args.look_at_coef,
         "global_scale": args.global_scale,
+        "gamma": args.gamma,
     }
     envs = make_envs(
         num_envs=args.num_envs, jax_device=jax_device, torch_device=device, coefs=r_coefs
