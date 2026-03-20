@@ -56,7 +56,7 @@ class Args:
     """the learning rate of the optimizer"""
     num_envs: int = 1024
     """the number of parallel game environments"""
-    num_steps: int = 12
+    num_steps: int = 8
     """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
     """Toggle learning rate annealing for policy and value networks"""
@@ -135,6 +135,7 @@ class RaceTrainEnv(VecDroneRaceEnv):
         self.autoreset = False  # Handle autoreset manually to fix termination swallowing
         self.prev_target_gate = self.data.target_gate[:, 0]
         self.segment_dist = jp.zeros((self.num_envs,))
+        self.prev_dist = jp.zeros((self.num_envs,))
         obs_spec = {
             # Euler angles: always in [-pi, pi]
             "rpy":            spaces.Box(-np.pi, np.pi,  shape=(3,), dtype=np.float32),
@@ -238,9 +239,11 @@ class RaceTrainEnv(VecDroneRaceEnv):
         if mask is None:
             self.prev_target_gate = target_gate
             self.segment_dist = dist
+            self.prev_dist = dist
         else:
             self.prev_target_gate = jp.where(mask, target_gate, self.prev_target_gate)
             self.segment_dist = jp.where(mask, dist, self.segment_dist)
+            self.prev_dist = jp.where(mask, dist, self.prev_dist)
         return obs, info
 
     def _step(self, action: Array) -> tuple[dict, Array, Array, Array, dict]:
@@ -269,9 +272,11 @@ class RaceTrainEnv(VecDroneRaceEnv):
             self.segment_dist = jp.where(passed, new_dist, self.segment_dist)
 
         self.prev_target_gate = target_gate
+        mask = self.data.marked_for_reset
+        self.prev_dist = jp.where(mask, self.prev_dist, self._last_dist_raw)
 
         # 4. Manual autoreset: ensures we returned the terminal state BEFORE wiping it
-        if (mask := self.data.marked_for_reset).any():
+        if mask.any():
             self._reset(mask=mask)
 
         # 5. Add reward components to info for logging
@@ -297,17 +302,19 @@ class RaceTrainEnv(VecDroneRaceEnv):
         drone_vel = self.sim.data.states.vel[:, 0, :]  # (N, 3)  from state — no prev needed
         to_gate = gate_pos - drone_pos
         dist_raw = jp.linalg.norm(to_gate, axis=-1, keepdims=False)
-        # Progress reward: 1.0 (at gate) to -1.0 (at segment start)
-        progress = 1.0 - 2.0 * (dist_raw / jp.maximum(self.segment_dist, 0.1))
-        progress = jp.clip(progress, -1.0, 1.0)
+        self._last_dist_raw = dist_raw
 
-        # dt = 1/self.freq
-        # progress = progress * dt
-
+        # Progress reward: change in distance towards goal
+        progress = self.prev_dist - dist_raw
+        
         # Detect gate pass: target gate incremented OR reached end (target_gate == -1)
         passed = (target_gate > self.prev_target_gate) | (
             (self.prev_target_gate == n_gates - 1) & (target_gate == -1)
         )
+        
+        # Reset progress on gate pass to avoid massive reward jump from target change
+        progress = jp.where(passed, 0.0, progress)
+        progress = jp.clip(progress, -1.0, 1.0)
 
         gate_reward = jp.where(passed, 100.0, 0.0)
         reward = progress + gate_reward
