@@ -56,7 +56,7 @@ class Args:
     """the learning rate of the optimizer"""
     num_envs: int = 1024
     """the number of parallel game environments"""
-    num_steps: int = 8
+    num_steps: int = 12
     """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
     """Toggle learning rate annealing for policy and value networks"""
@@ -98,11 +98,10 @@ class Args:
 
     # Wrapper settings
     n_obs: int = 2
-    rpy_coef: float = 0.06
-    d_act_th_coef: float = 0.4
-    d_act_xy_coef: float = 1.0
-    act_coef: float = 0.02
-    look_at_coef: float = 0.05
+    d_act_th_coef: float = 0.01
+    d_act_xy_coef: float = 0.01
+    act_coef: float = 0.01
+    look_at_coef: float = 0.01
     global_scale = 0.01
     """reward coefficients for training"""
 
@@ -133,7 +132,9 @@ class RaceTrainEnv(VecDroneRaceEnv):
     def __init__(self, **kwargs):
         """Init – delegates to parent then overrides the observation space."""
         super().__init__(**kwargs)
-        self.prev_target_gate = jp.zeros((self.num_envs, 1), dtype=int)
+        self.autoreset = False  # Handle autoreset manually to fix termination swallowing
+        self.prev_target_gate = self.data.target_gate[:, 0]
+        self.segment_dist = jp.zeros((self.num_envs,))
         obs_spec = {
             # Euler angles: always in [-pi, pi]
             "rpy":            spaces.Box(-np.pi, np.pi,  shape=(3,), dtype=np.float32),
@@ -177,7 +178,8 @@ class RaceTrainEnv(VecDroneRaceEnv):
         gates_pos  = base["gates_pos"][:, 0, :, :]   # (N, n_gates, 3)  squeeze drone dim
         gates_quat = base["gates_quat"][:, 0, :, :]  # (N, n_gates, 4)
 
-        target_idx = jp.clip(base["target_gate"][:, 0], 0, n_gates - 1)  # (N,)
+        target_gate = base["target_gate"][:, 0]
+        target_idx = jp.clip(target_gate, 0, n_gates - 1)  # (N,)
         next_idx   = jp.clip(target_idx + 1, 0, n_gates - 1)             # (N,) wraps at last gate
 
         env_ids = jp.arange(self.num_envs)
@@ -217,8 +219,8 @@ class RaceTrainEnv(VecDroneRaceEnv):
         return {
             "rpy":            rpy[:, None, :],             # (N, 1, 3)
             "vel_body":       vel_body[:, None, :],        # (N, 1, 3)
-            "dist_target":    dist_target[:, None, :],     # (N, 1, 1)
-            "dist_next":      dist_next[:, None, :],       # (N, 1, 1)
+            "dist_target":    dist_target_raw[:, None, :],     # (N, 1, 1)
+            "dist_next":      dist_next_raw[:, None, :],       # (N, 1, 1)
             "gate_vec_body":  gate_vec_body[:, None, :],   # (N, 1, 3)
             "gate_alignment": gate_alignment[:, None, :],  # (N, 1, 1)
         }
@@ -226,18 +228,56 @@ class RaceTrainEnv(VecDroneRaceEnv):
     def _reset(self, mask: Array | None = None, **kwargs) -> tuple[dict, dict]:
         """Reset the environment and the target gate tracker."""
         obs, info = super()._reset(mask=mask, **kwargs)
+        target_gate = self.data.target_gate[:, 0]
+        
+        # Calculate initial segment distance (distance to gate 0 from start pos)
+        drone_pos = self.sim.data.states.pos[:, 0, :]
+        gate_pos = self.sim.mjx_data.mocap_pos[jp.arange(self.num_envs), self.data.gate_mj_ids[0]]
+        dist = jp.linalg.norm(gate_pos - drone_pos, axis=-1)
+        
         if mask is None:
-            self.prev_target_gate = self.data.target_gate
+            self.prev_target_gate = target_gate
+            self.segment_dist = dist
         else:
-            self.prev_target_gate = jp.where(
-                mask[..., None], self.data.target_gate, self.prev_target_gate
-            )
+            self.prev_target_gate = jp.where(mask, target_gate, self.prev_target_gate)
+            self.segment_dist = jp.where(mask, dist, self.segment_dist)
         return obs, info
 
     def _step(self, action: Array) -> tuple[dict, Array, Array, Array, dict]:
-        """Step the environment and update the target gate tracker."""
+        """Step the environment and update the target gate tracker with manual autoreset."""
+        # 1. Step the base (RaceCoreEnv._step) which now has autoreset=False
         obs, reward, terminated, truncated, info = super()._step(action)
-        self.prev_target_gate = self.data.target_gate
+        
+        # 2. Fix Warping Lag: manually warp drones that just crashed in THIS step
+        # Note: reward/terminated already reflect the latest self.data
+        self.sim.data = self._warp_disabled_drones(self.sim.data, self.data.disabled_drones)
+
+        # 3. Update tracker for reward calculation in NEXT step (using latest data)
+        target_gate = self.data.target_gate[:, 0]
+        passed = (target_gate > self.prev_target_gate) | (
+            (self.prev_target_gate == len(self.gates["pos"]) - 1) & (target_gate == -1)
+        )
+        
+        if passed.any():
+            # Update segment_dist for the NEW target gate
+            drone_pos = self.sim.data.states.pos[:, 0, :]
+            n_gates = len(self.gates["pos"])
+            clamped = jp.clip(target_gate, 0, n_gates - 1)
+            gate_pos = self.sim.mjx_data.mocap_pos[jp.arange(self.num_envs), self.data.gate_mj_ids[clamped]]
+            new_dist = jp.linalg.norm(gate_pos - drone_pos, axis=-1)
+            # Only update for environments that just passed a gate
+            self.segment_dist = jp.where(passed, new_dist, self.segment_dist)
+
+        self.prev_target_gate = target_gate
+
+        # 4. Manual autoreset: ensures we returned the terminal state BEFORE wiping it
+        if (mask := self.data.marked_for_reset).any():
+            self._reset(mask=mask)
+
+        # 5. Add reward components to info for logging
+        if hasattr(self, "_last_reward_components"):
+            info.update(self._last_reward_components)
+
         return obs, reward, terminated, truncated, info
 
     def reward(self) -> Array:
@@ -246,29 +286,45 @@ class RaceTrainEnv(VecDroneRaceEnv):
         reward = dot(vel, unit_vec_to_gate) + 100 * passed_gate
 
         Positive when moving toward the gate, negative when drifting away,
-        Crash penalty = -100 when the drone is disabled.
+        Crash penalty = -10.0 when the drone is disabled.
         """
         n_gates = len(self.gates["pos"])
-        clamped = jp.clip(self.data.target_gate[:, 0], 0, n_gates - 1)
+        target_gate = self.data.target_gate[:, 0]
+        clamped = jp.clip(target_gate, 0, n_gates - 1)
 
         gate_pos = self.sim.mjx_data.mocap_pos[jp.arange(self.num_envs), self.data.gate_mj_ids[clamped]]
         drone_pos = self.sim.data.states.pos[:, 0, :]  # (N, 3)  from state
         drone_vel = self.sim.data.states.vel[:, 0, :]  # (N, 3)  from state — no prev needed
         to_gate = gate_pos - drone_pos
-        dist = jp.linalg.norm(to_gate, axis=-1, keepdims=True).clip(1e-6)
-        progress = jp.sum(drone_vel * (to_gate / dist), axis=-1, keepdims=False)  # (N,)
+        dist_raw = jp.linalg.norm(to_gate, axis=-1, keepdims=False)
+        # Progress reward: 1.0 (at gate) to -1.0 (at segment start)
+        progress = 1.0 - 2.0 * (dist_raw / jp.maximum(self.segment_dist, 0.1))
+        progress = jp.clip(progress, -1.0, 1.0)
+
+        # dt = 1/self.freq
+        # progress = progress * dt
 
         # Detect gate pass: target gate incremented OR reached end (target_gate == -1)
-        passed = (self.data.target_gate > self.prev_target_gate) | (
-            (self.prev_target_gate == n_gates - 1) & (self.data.target_gate == -1)
+        passed = (target_gate > self.prev_target_gate) | (
+            (self.prev_target_gate == n_gates - 1) & (target_gate == -1)
         )
 
-        reward = progress + jp.where(passed, 100.0, 0.0)
+        gate_reward = jp.where(passed, 100.0, 0.0)
+        reward = progress + gate_reward
 
-        disabled = self.data.disabled_drones[:, :1]
-        is_finished = self.data.target_gate == -1
-        # Crash penalty only if disabled but NOT finished
-        return jp.where(disabled & ~is_finished, -10.0, reward)
+        disabled = self.data.disabled_drones[:, 0]
+        is_finished = target_gate == -1
+        # Crash penalty only if disabled but NOT finished. Return (N, 1) for VecDroneRaceEnv.
+        crash_penalty = jp.where(disabled & ~is_finished, -100.0, 0.0)
+        
+        # Store components for info()
+        self._last_reward_components = {
+            "reward_progress": progress[:, None],
+            "reward_gate": gate_reward[:, None],
+            "penalty_crash": crash_penalty[:, None],
+        }
+
+        return (reward + crash_penalty)[:, None]
 
 
 # region Wrappers
@@ -338,10 +394,18 @@ class ActionPenalty(VectorObservationWrapper):
         # penalty on actions
         action_diff = action - self._last_action
         # energy
-        reward -= self.act_coef * action[..., -1] ** 2
+        act_penalty = self.act_coef * action[..., -1] ** 2
+        reward -= act_penalty
         # smoothness
-        reward -= self.d_act_th_coef * action_diff[..., -1] ** 2
-        reward -= self.d_act_xy_coef * jp.sum(action_diff[..., :3] ** 2, axis=-1)
+        smoothness_th_penalty = self.d_act_th_coef * action_diff[..., -1] ** 2
+        smoothness_xy_penalty = self.d_act_xy_coef * jp.sum(action_diff[..., :3] ** 2, axis=-1)
+        reward -= smoothness_th_penalty
+        reward -= smoothness_xy_penalty
+        
+        info["penalty_action"] = -act_penalty
+        info["penalty_smoothness_thrust"] = -smoothness_th_penalty
+        info["penalty_smoothness_xy"] = -smoothness_xy_penalty
+        
         self._last_action = action
         return self.observations(obs), reward, terminated, truncated, info
 
@@ -373,7 +437,10 @@ class LookAtPenalty(VectorObservationWrapper):
         cos_theta = gate_vec_body[:, 0]
         angle = jp.acos(jp.clip(cos_theta, -1.0, 1.0))
         # apply penalty if angle > 60 degrees (pi/3)
-        reward -= jp.where(angle > (jp.pi / 3), self.look_at_coef, 0.0)
+        look_at_penalty = jp.where(angle > (jp.pi / 2), self.look_at_coef, 0.0)
+        reward -= look_at_penalty
+        
+        info["penalty_look_at"] = -look_at_penalty
 
         return self.observations(obs), reward, terminated, truncated, info
 
@@ -402,7 +469,7 @@ class RunningMeanStd:
     """Tracks the running mean and variance of a data stream."""
 
     # https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Parallel_algorithm
-    def __init__(self, epsilon: float = 1e-4, shape: tuple = ()):
+    def __init__(self, epsilon: float = 1.0, shape: tuple = ()):
         """Init."""
         self.mean = jp.zeros(shape, "float32")
         self.var = jp.ones(shape, "float32")
@@ -440,10 +507,10 @@ class VecNormalize(VectorWrapper):
         venv: VectorEnv,
         ob=True,
         ret=True,
-        clipob=10.0,
+        clipob=100.0,
         cliprew=100.0,
         gamma=0.94,
-        epsilon=1e-8,
+        epsilon=1e-4,
         training=True,
     ):
         """Init."""
@@ -666,7 +733,6 @@ def train_ppo(
     # env setup
     r_coefs = {
         "n_obs": args.n_obs,
-        "rpy_coef": args.rpy_coef,
         "d_act_xy_coef": args.d_act_xy_coef,
         "d_act_th_coef": args.d_act_th_coef,
         "act_coef": args.act_coef,
@@ -691,7 +757,7 @@ def train_ppo(
     checkpoint_dir.mkdir(exist_ok=True)
     start_iteration = 1
     global_step = 0
-    best_mean_reward = -float("inf")
+    best_raw_reward = -float("inf")
 
     if args.resume:
         latest_checkpoint = checkpoint_dir / "latest.ckpt"
@@ -707,7 +773,7 @@ def train_ppo(
                 vec_norm.set_stats(checkpoint["vec_normalize_stats"])
             global_step = checkpoint["global_step"]
             start_iteration = checkpoint["iteration"] + 1
-            best_mean_reward = checkpoint.get("best_mean_reward", -float("inf"))
+            best_raw_reward = checkpoint.get("best_raw_reward", -float("inf"))
         else:
             print(f"No checkpoint found at {latest_checkpoint} to resume from.")
 
@@ -730,7 +796,18 @@ def train_ppo(
     next_done = torch.zeros(args.num_envs).to(device)
     sum_rewards = torch.zeros((args.num_envs)).to(device)
     sum_rewards_raw = torch.zeros((args.num_envs)).to(device)
+    sum_steps = torch.zeros((args.num_envs)).to(device)
+    
+    # Components accumulators
+    component_keys = [
+        "reward_progress", "reward_gate", "penalty_crash",
+        "penalty_action", "penalty_smoothness_thrust", "penalty_smoothness_xy",
+        "penalty_look_at"
+    ]
+    sum_components = {k: torch.zeros((args.num_envs)).to(device) for k in component_keys}
+    
     sum_rewards_hist = []
+    sum_rewards_raw_hist = []
 
     for iteration in range(start_iteration, args.num_iterations + 1):
         start_time = time.time()
@@ -758,19 +835,56 @@ def train_ppo(
             # envs.render()
             rewards[step] = reward
             sum_rewards += reward
+            sum_steps += 1
             if "reward_raw" in infos:
                 sum_rewards_raw += torch.as_tensor(infos["reward_raw"]).to(device)
+            
+            for k in component_keys:
+                if k in infos:
+                    sum_components[k] += torch.as_tensor(infos[k]).to(device).flatten()
+
             sum_rewards_hist.extend(sum_rewards[next_done.bool()].tolist())
+            sum_rewards_raw_hist.extend(sum_rewards_raw[next_done.bool()].tolist())
+
             if wandb_enabled and next_done.any():
-                for r, r_raw in zip(
-                    sum_rewards[next_done.bool()], sum_rewards_raw[next_done.bool()]
-                ):
-                    wandb.log(
-                        {"train/reward": r.item(), "train/reward_raw": r_raw.item()},
-                        step=global_step,
-                    )
+                mask = next_done.bool()
+                lengths = torch.maximum(sum_steps[mask], torch.ones_like(sum_steps[mask]))
+                
+                log_dict = {
+                    "train/reward": (sum_rewards[mask]).mean().item(),
+                    "train/reward_raw": (sum_rewards_raw[mask]).mean().item(),
+                    "charts/avg_episode_length": lengths.mean().item(),
+                }
+                
+                # Track crash/success rates if components exist
+                if "penalty_crash" in sum_components:
+                    crashes = (sum_components["penalty_crash"][mask] <= -10.0).float()
+                    log_dict["charts/crash_rate"] = crashes.mean().item()
+                
+                if "reward_gate" in sum_components:
+                    successes = (sum_components["reward_gate"][mask] > 0).float()
+                    log_dict["charts/success_rate"] = successes.mean().item()
+                
+                per_step_components = [
+                    "reward_progress", "penalty_action", 
+                    "penalty_smoothness_thrust", "penalty_smoothness_xy", 
+                    "penalty_look_at"
+                ]
+                
+                for k in component_keys:
+                    if k in sum_components:
+                        if k in per_step_components:
+                            log_dict[f"train/{k}"] = (sum_components[k][mask]).mean().item()
+                        else:
+                            log_dict[f"train/{k}"] = sum_components[k][mask].mean().item()
+                
+                wandb.log(log_dict, step=global_step)
+            
             sum_rewards[next_done.bool()] = 0
             sum_rewards_raw[next_done.bool()] = 0
+            sum_steps[next_done.bool()] = 0
+            for k in component_keys:
+                sum_components[k][next_done.bool()] = 0
             next_done = terminations | truncations
 
         # bootstrap value if not done
@@ -883,6 +997,9 @@ def train_ppo(
             avg_reward = (
                 np.mean(sum_rewards_hist[-100:]) if sum_rewards_hist else -float("inf")
             )
+            avg_raw_reward = (
+                np.mean(sum_rewards_raw_hist[-100:]) if sum_rewards_raw_hist else -float("inf")
+            )
             latest_path = checkpoint_dir / "latest.ckpt"
             state = {
                 "agent_state_dict": agent.state_dict(),
@@ -890,16 +1007,16 @@ def train_ppo(
                 "vec_normalize_stats": vec_norm.get_stats() if vec_norm else None,
                 "iteration": iteration,
                 "global_step": global_step,
-                "best_mean_reward": best_mean_reward,
+                "best_raw_reward": best_raw_reward,
             }
             torch.save(state, latest_path)
-            print(f"Latest checkpoint saved to {latest_path} (Average Reward: {avg_reward:.2f})")
+            print(f"Latest checkpoint saved to {latest_path} (Avg Raw Reward: {avg_raw_reward:.2f})")
 
-            if avg_reward > best_mean_reward:
-                best_mean_reward = avg_reward
+            if avg_raw_reward > best_raw_reward:
+                best_raw_reward = avg_raw_reward
                 best_path = checkpoint_dir / "best.ckpt"
                 torch.save(state, best_path)
-                print(f"New best model saved to {best_path} (Reward: {best_mean_reward:.2f})")
+                print(f"New best model saved to {best_path} (Raw Reward: {best_raw_reward:.2f})")
         # endregion
 
         end_time = time.time()
@@ -918,7 +1035,6 @@ def evaluate_ppo(args: Args, n_eval: int) -> tuple[float, float]:
     device = torch.device("cpu")
     r_coefs = {
         "n_obs": args.n_obs,
-        "rpy_coef": args.rpy_coef,
         "d_act_xy_coef": args.d_act_xy_coef,
         "d_act_th_coef": args.d_act_th_coef,
         "act_coef": args.act_coef,

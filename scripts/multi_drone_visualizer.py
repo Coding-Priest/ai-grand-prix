@@ -272,7 +272,7 @@ def visualize(
             print("All drones finished or episode truncated.")
             break
         
-        if i % 50 == 0:
+        if i % 10 == 0:
             active_count = active_drones.sum()
             print(f"Step {i}: {active_count}/{n_drones} drones active (Real FPS: {i / (time.time() - start_time):.1f})")
             

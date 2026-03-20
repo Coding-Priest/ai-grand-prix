@@ -99,5 +99,5 @@ ang_vel = [0, 0, 0]
 
 # If the drones exceed those bounds in real, the run will be stopped and the drone will safely be returned to the starting position
 [env.track.safety_limits]
-pos_limit_low = [-2.5, -1.5, -1e-3]
+pos_limit_low = [-2.5, -1.5, 1e-2]
 pos_limit_high = [2.5, 1.5, 2.0]

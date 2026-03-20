@@ -325,7 +325,7 @@ class RaceCoreEnv:
             obstacle_mj_ids=obstacle_ids,
             max_episode_steps=max_episode_steps,
             sensor_range=sensor_range,
-            pos_limit_low=[-3, -3, -1e-3],
+            pos_limit_low=[-3, -3, 1e-3],
             pos_limit_high=[3, 3, 2.5],
             device=self.device,
         )
