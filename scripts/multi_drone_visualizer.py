@@ -158,7 +158,7 @@ def visualize(
     config: str = "level0.toml",
     checkpoint: str = "lsy_drone_racing/control/checkpoints/latest.ckpt",
     n_drones: int = 5,
-    stochastic: bool = True,
+    stochastic: bool = False,
     seed: int = 42,
 ):
     """Run visualization."""

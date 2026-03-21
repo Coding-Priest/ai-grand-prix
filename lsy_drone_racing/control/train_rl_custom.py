@@ -50,13 +50,13 @@ class Args:
     """the entity (team) of wandb's project"""
 
     # Algorithm specific arguments
-    total_timesteps: int = 15_000_000
+    total_timesteps: int = 150_000_000
     """total timesteps of the experiments"""
     learning_rate: float = 1.5e-4
     """the learning rate of the optimizer"""
-    num_envs: int = 1024
+    num_envs: int = 512
     """the number of parallel game environments"""
-    num_steps: int = 8
+    num_steps: int = 128
     """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
     """Toggle learning rate annealing for policy and value networks"""
@@ -64,7 +64,7 @@ class Args:
     """the discount factor gamma"""
     gae_lambda: float = 0.97
     """the lambda for the general advantage estimation"""
-    num_minibatches: int = 8
+    num_minibatches: int = 1
     """the number of mini-batches"""
     update_epochs: int = 10
     """the K epochs to update the policy"""
@@ -305,7 +305,7 @@ class RaceTrainEnv(VecDroneRaceEnv):
         self._last_dist_raw = dist_raw
 
         # Progress reward: change in distance towards goal
-        progress = self.prev_dist - dist_raw
+        progress = (self.prev_dist - dist_raw) * 100
         
         # Detect gate pass: target gate incremented OR reached end (target_gate == -1)
         passed = (target_gate > self.prev_target_gate) | (
@@ -322,7 +322,7 @@ class RaceTrainEnv(VecDroneRaceEnv):
         disabled = self.data.disabled_drones[:, 0]
         is_finished = target_gate == -1
         # Crash penalty only if disabled but NOT finished. Return (N, 1) for VecDroneRaceEnv.
-        crash_penalty = jp.where(disabled & ~is_finished, -100.0, 0.0)
+        crash_penalty = jp.where(disabled & ~is_finished, -50.0, 0.0)
         
         # Store components for info()
         self._last_reward_components = {
@@ -680,27 +680,26 @@ class Agent(nn.Module):
         obs_dim = torch.tensor(obs_shape).prod()
         self.critic = nn.Sequential(
             # nn.LayerNorm(obs_dim),
-            layer_init(nn.Linear(obs_dim, 64)),
+            layer_init(nn.Linear(obs_dim, 256)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
+            layer_init(nn.Linear(256, 256)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 1), std=1.0),
+            layer_init(nn.Linear(256, 1), std=1.0),
         )
         self.actor_mean = nn.Sequential(
             # nn.LayerNorm(obs_dim),
-            layer_init(nn.Linear(obs_dim, 64)),
+            layer_init(nn.Linear(obs_dim, 256)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
+            layer_init(nn.Linear(256, 256)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, torch.tensor(action_shape).prod()), std=0.01),
-            nn.Tanh(),
+            layer_init(nn.Linear(256, torch.tensor(action_shape).prod()), std=0.01),
+        )
+        self.actor_logstd = nn.Parameter(
+            torch.Tensor([[-1, -1, -1, 1]])  # start with smaller std for roll, pitch, yaw
         )
         # self.actor_logstd = nn.Parameter(
-        #     torch.Tensor([[-1, -1, -1, 1]])  # start with smaller std for roll, pitch, yaw
+        #     torch.zeros(1, torch.tensor(action_shape).prod()) 
         # )
-        self.actor_logstd = nn.Parameter(
-            torch.zeros(1, torch.tensor(action_shape).prod()) 
-        )
 
     def get_value(self, x: Tensor) -> Tensor:
         """Value estimation."""
@@ -1108,7 +1107,7 @@ def evaluate_ppo(args: Args, n_eval: int) -> tuple[float, float]:
 # region Main
 def main(
     wandb_enabled: bool = True,
-    train: bool = True,
+    train: bool = False,
     eval: int = 1,
     checkpoint_freq: float = 0.1,
     resume: bool = False,
