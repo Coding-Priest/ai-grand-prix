@@ -100,11 +100,9 @@ class MultiRaceTrainEnv(VecMultiDroneRaceEnv):
         next_gate_pos    = gates_pos[drone_ids, next_idx]
         target_gate_quat = gates_quat[drone_ids, target_idx]
 
-        # 3. Exponential distance
+        # 3. Distance (raw, matching RaceTrainEnv)
         dist_target_raw = jp.linalg.norm(drone_pos - target_gate_pos, axis=-1, keepdims=True)
         dist_next_raw   = jp.linalg.norm(drone_pos - next_gate_pos,   axis=-1, keepdims=True)
-        dist_target = 2.0 * jp.exp(-2.0 * dist_target_raw) - 1.0
-        dist_next   = 2.0 * jp.exp(-2.0 * dist_next_raw) - 1.0
 
         # 4. Unit vector to gate
         gate_vec_world = target_gate_pos - drone_pos
@@ -122,11 +120,12 @@ class MultiRaceTrainEnv(VecMultiDroneRaceEnv):
         return {
             "rpy":            rpy,
             "vel_body":       vel_body,
-            "dist_target":    dist_target,
-            "dist_next":      dist_next,
+            "dist_target":    dist_target_raw,
+            "dist_next":      dist_next_raw,
             "gate_vec_body":  gate_vec_body,
             "gate_alignment": gate_alignment,
         }
+
 
     def reset(self, **kwargs):
         """Reset the environment."""
@@ -156,7 +155,8 @@ class MultiRaceTrainEnv(VecMultiDroneRaceEnv):
 # region Visualization
 def visualize(
     config: str = "level0.toml",
-    checkpoint: str = "lsy_drone_racing/control/checkpoints/latest.ckpt",
+    checkpoint: str = "lsy_drone_racing/control/checkpoints/best.ckpt",
+    n_eval: int = 1,
     n_drones: int = 5,
     stochastic: bool = False,
     seed: int = 42,
@@ -218,64 +218,73 @@ def visualize(
         print("Applying VecNormalize stats from checkpoint...")
         vec_norm.set_stats(ckpt["vec_normalize_stats"])
     
-    # Reset
-    next_obs, info = env.reset(seed=seed)
-    # Zero-copy conversion for JAX to Torch (stays on GPU)
-    next_obs = torch.from_dlpack(next_obs).to(device)
+    # Evaluate the policy
+    episode_rewards = []
+    episode_lengths = []
+    ep_seed = seed
+    fps = 60
     
     print(f"Starting simulation with {n_drones} drones at {cfg.env.freq} Hz...")
     
-    fps = 60
-    i = 0
-    start_time = time.time()
-    while True:
-        # 1. Synchronize with real time for smooth playback
-        elapsed = time.time() - start_time
-        target_elapsed = i / cfg.env.freq
-        if target_elapsed > elapsed:
-            time.sleep(target_elapsed - elapsed)
+    with torch.no_grad():
+        for episode in range(n_eval):
+            # Reset with incremental seed
+            next_obs, info = env.reset(seed=(ep_seed := ep_seed + 1))
+            # Zero-copy conversion for JAX to Torch (stays on GPU)
+            next_obs = torch.from_dlpack(next_obs).to(device)
+            
+            done = torch.zeros(n_drones, dtype=torch.bool, device=device)
+            episode_reward = 0
+            steps = 0
+            start_time = time.time()
+            
+            while not done.any():
+                # 1. Synchronize with real time for smooth playback
+                elapsed = time.time() - start_time
+                target_elapsed = steps / cfg.env.freq
+                if target_elapsed > elapsed:
+                    time.sleep(target_elapsed - elapsed)
 
-        # 2. Update camera (using unwrapped to access physics)
-        unwrapped = env.unwrapped
-        active_drones = ~unwrapped.data.disabled_drones[0] # (D,)
-        if active_drones.any():
-            avg_pos = unwrapped.sim.data.states.pos[0, active_drones].mean(axis=0)
-            unwrapped.cam_config["lookat"] = np.array(avg_pos)
-            if active_drones.sum() > 1:
-                spread = jp.linalg.norm(unwrapped.sim.data.states.pos[0, active_drones].max(axis=0) - unwrapped.sim.data.states.pos[0, active_drones].min(axis=0))
-                unwrapped.cam_config["distance"] = max(2.5, spread * 1.5)
-        
-        # 3. Get actions from Agent
-        with torch.no_grad():
-            action_mean = agent.actor_mean(next_obs)
-            if stochastic:
-                action_std = torch.exp(agent.actor_logstd.expand_as(action_mean))
-                probs = torch.distributions.Normal(action_mean, action_std)
-                action = probs.sample()
-            else:
-                action = action_mean
-            
-        # 4. Step environment
-        # Zero-copy conversion for Torch to JAX (stays on GPU)
-        action_jax = jax.dlpack.from_dlpack(action)
-        next_obs, reward, terminated, truncated, info = env.step(action_jax)
-        # Zero-copy conversion for JAX back to Torch (stays on GPU)
-        next_obs = torch.from_dlpack(next_obs).to(device)
-        
-        # 5. Render
-        if ((i * fps) % cfg.env.freq) < fps:
-            unwrapped.render()
-            
-        i += 1
-        # In vectorized env, terminated/truncated are (num_envs,)
-        if terminated.all() or truncated.all():
-            print("All drones finished or episode truncated.")
-            break
-        
-        if i % 10 == 0:
-            active_count = active_drones.sum()
-            print(f"Step {i}: {active_count}/{n_drones} drones active (Real FPS: {i / (time.time() - start_time):.1f})")
-            
+                # 2. Update camera (using unwrapped to access physics)
+                unwrapped = env.unwrapped
+                active_drones = ~unwrapped.data.disabled_drones[0] # (D,)
+                if active_drones.any():
+                    avg_pos = unwrapped.sim.data.states.pos[0, active_drones].mean(axis=0)
+                    unwrapped.cam_config["lookat"] = np.array(avg_pos)
+                    if active_drones.sum() > 1:
+                        spread = jp.linalg.norm(unwrapped.sim.data.states.pos[0, active_drones].max(axis=0) - unwrapped.sim.data.states.pos[0, active_drones].min(axis=0))
+                        unwrapped.cam_config["distance"] = max(2.5, spread * 1.5)
+                
+                # 3. Get actions from Agent
+                act, _, _, _ = agent.get_action_and_value(next_obs, deterministic=not stochastic)
+                    
+                # 4. Step environment
+                # Zero-copy conversion for Torch to JAX (stays on GPU)
+                action_jax = jax.dlpack.from_dlpack(act)
+                next_obs, reward, terminated, truncated, info = env.step(action_jax)
+                # Zero-copy conversion for JAX back to Torch (stays on GPU)
+                next_obs = torch.from_dlpack(next_obs).to(device)
+                
+                # 5. Render
+                if ((steps * fps) % cfg.env.freq) < fps:
+                    unwrapped.render()
+                    
+                done = torch.from_numpy(np.array(terminated | truncated)).to(device)
+                episode_reward += reward[0].item() # Track first drone's reward
+                steps += 1
+                
+                if steps % 10 == 0:
+                    active_count = active_drones.sum()
+                    print(f"Episode {episode+1} | Step {steps}: {active_count}/{n_drones} drones active (FPS: {steps / (time.time() - start_time):.1f})", end="\r")
+                    
+            episode_rewards.append(episode_reward)
+            episode_lengths.append(steps)
+            print(f"\nEpisode {episode + 1}: Reward = {episode_reward:.2f}, Length = {steps}")
+
+        print(
+            f"\nAverage Reward = {np.mean(episode_rewards):.2f}, Length = {np.mean(episode_lengths)}"
+        )
+    
     env.close()
 
 if __name__ == "__main__":
