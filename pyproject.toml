@@ -22,6 +22,11 @@ dependencies = [
     "kornia>=0.8.2",
     "rerun-sdk>=0.30.2",
     "pynput>=1.8.1",
+    "pyzmq>=27.1.0",
+    "matplotlib>=3.10.8",
+    "tqdm>=4.67.3",
+    "stable-baselines3>=2.7.1",
+    "tensorboard>=2.20.0",
 ]
 
 [project.optional-dependencies]

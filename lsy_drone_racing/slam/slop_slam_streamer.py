@@ -4,6 +4,7 @@ import struct
 import time
 import sys
 from typing import Optional
+
 import cv2
 import numpy as np
 
@@ -12,11 +13,13 @@ class SLAMStreamer:
     """Streams video frames to an ORB-SLAM3 TCP server."""
 
     def __init__(
-        self, host: str = "localhost", port: int = 9999, jpeg_quality: int = 80
+        self, host: str = "localhost", port: int = 9999, jpeg_quality: int = 80, record_path: Optional[str] = None
     ):
         self.host = host
         self.port = port
         self.jpeg_quality = jpeg_quality
+        self.record_path = record_path
+        self.record_file = None
         self.sock = None
         self.frame_count = 0
         self.start_time = None
@@ -26,6 +29,9 @@ class SLAMStreamer:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.connect((self.host, self.port))
         self.start_time = time.monotonic()
+        if self.record_path:
+            self.record_file = open(self.record_path, "wb")
+            print(f"Recording stream to {self.record_path}")
         print(f"Connected to SLAM server at {self.host}:{self.port}")
 
     def send_frame(self, frame: np.ndarray, timestamp: Optional[float] = None):
@@ -61,6 +67,10 @@ class SLAMStreamer:
 
         # Send JPEG payload
         sock.sendall(jpeg_bytes)
+        
+        if self.record_file:
+            self.record_file.write(header)
+            self.record_file.write(jpeg_bytes)
 
         self.frame_count += 1
 
@@ -97,7 +107,10 @@ class SLAMStreamer:
             gyro[1],
             gyro[2],
         )
-        sock.sendall(header + payload)
+        data = header + payload
+        sock.sendall(data)
+        if self.record_file:
+            self.record_file.write(data)
 
     def send_reset(self):
         """Send a command to reset the active SLAM map."""
@@ -109,12 +122,17 @@ class SLAMStreamer:
         # Payload size = 0
         header = struct.pack("<II", 3, 0)
         sock.sendall(header)
+        if self.record_file:
+            self.record_file.write(header)
 
     def send_end_of_stream(self):
         """Signal end-of-stream to the server (message_type = 0)."""
         sock = self.sock
         if sock is not None:
-            sock.sendall(struct.pack("<II", 0, 0))
+            msg = struct.pack("<II", 0, 0)
+            sock.sendall(msg)
+            if self.record_file:
+                self.record_file.write(msg)
 
     def close(self):
         """Send end-of-stream and close connection."""
@@ -122,6 +140,9 @@ class SLAMStreamer:
         if self.sock is not None:
             self.sock.close()
             self.sock = None
+        if self.record_file is not None:
+            self.record_file.close()
+            self.record_file = None
         print(f"Connection closed. Sent {self.frame_count} frames.")
 
     def __enter__(self):

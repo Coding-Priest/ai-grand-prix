@@ -31,11 +31,13 @@ def load_track(track: ConfigDict) -> tuple[ConfigDict, ConfigDict, ConfigDict]:
         The gates, obstacles, and drones as config dicts.
     """
     assert "gates" in track, "Track must contain gates field."
-    assert "obstacles" in track, "Track must contain obstacles field."
+    # assert "obstacles" in track, "Track must contain obstacles field."
     assert "drones" in track, "Track must contain drones field."
     gate_pos = np.array([g["pos"] for g in track.gates], dtype=np.float32)
     gate_quat = (
-        R.from_euler("xyz", np.array([g["rpy"] for g in track.gates])).as_quat().astype(np.float32)
+        R.from_euler("xyz", np.array([g["rpy"] for g in track.gates]))
+        .as_quat()
+        .astype(np.float32)
     )
     gates = {
         "pos": gate_pos,
@@ -93,7 +95,9 @@ def gate_passed(
     y_intersect = alpha * (pos_local[1]) + (1 - alpha) * last_pos_local[1]
     z_intersect = alpha * (pos_local[2]) + (1 - alpha) * last_pos_local[2]
     # Divide gate size by 2 to get the distance from the center to the edges
-    in_box = (abs(y_intersect) < gate_size[0] / 2) & (abs(z_intersect) < gate_size[1] / 2)
+    in_box = (abs(y_intersect) < gate_size[0] / 2) & (
+        abs(z_intersect) < gate_size[1] / 2
+    )
     return passed_plane & in_box
 
 
@@ -129,8 +133,12 @@ def generate_random_track(
         New track layout with randomized tracks
     """
     # Get infos from track
-    xmin, ymin = jnp.array(track.safety_limits["pos_limit_low"][:2]) + border_safety_margin
-    xmax, ymax = jnp.array(track.safety_limits["pos_limit_high"][:2]) - border_safety_margin
+    xmin, ymin = (
+        jnp.array(track.safety_limits["pos_limit_low"][:2]) + border_safety_margin
+    )
+    xmax, ymax = (
+        jnp.array(track.safety_limits["pos_limit_high"][:2]) - border_safety_margin
+    )
     start_pos = jax.random.uniform(
         key,
         (2,),
@@ -171,7 +179,9 @@ def generate_random_track(
     keys_obs = jax.random.split(keys[-1], N_obstacles)
 
     # --- Helper: yaw adjustment ---
-    def adjust_yaw(i: int, yaw: jnp.floating, gates: Array, candidate: Array) -> jnp.floating:
+    def adjust_yaw(
+        i: int, yaw: jnp.floating, gates: Array, candidate: Array
+    ) -> jnp.floating:
         prev_pos = jax.lax.cond(
             i == 0, lambda _: start_pos, lambda _: gates[i - 1, :2], operand=None
         )
@@ -195,7 +205,9 @@ def generate_random_track(
 
         flat_mask = mask.reshape(-1)
         total = flat_mask.sum()
-        p = jnp.where(total > 0, flat_mask / total, jnp.ones_like(flat_mask) / flat_mask.size)
+        p = jnp.where(
+            total > 0, flat_mask / total, jnp.ones_like(flat_mask) / flat_mask.size
+        )
         idx = jax.random.choice(sub_pos, flat_mask.shape[0], p=p)
         chosen_center = coords_flat[idx]
 
@@ -210,7 +222,10 @@ def generate_random_track(
 
         # sample yaw and adjust
         yaw = jax.random.uniform(
-            sub_yaw, (), minval=-yaw_offset_randomization, maxval=yaw_offset_randomization
+            sub_yaw,
+            (),
+            minval=-yaw_offset_randomization,
+            maxval=yaw_offset_randomization,
         )
         # yaw = adjust_yaw(i, yaw, gates, candidate)
         yaw = adjust_yaw(i, yaw, gates, candidate)
@@ -221,10 +236,14 @@ def generate_random_track(
         # mask out circular region around gate
         dist2 = jnp.sum((coords - candidate) ** 2, axis=-1)
         gate_distance_mask = gate_distance_mask * (dist2 > (gates_min_r**2))
-        gate_distance_mask_obstacles = gate_distance_mask_obstacles * (dist2 > (obstacle_min_r**2))
+        gate_distance_mask_obstacles = gate_distance_mask_obstacles * (
+            dist2 > (obstacle_min_r**2)
+        )
 
         # mask out corridor from prev gate or start
-        prev_pos = jax.lax.cond(i == 0, lambda _: start_pos, lambda _: gates[i - 1, :2], None)
+        prev_pos = jax.lax.cond(
+            i == 0, lambda _: start_pos, lambda _: gates[i - 1, :2], None
+        )
         v = candidate - prev_pos
         v_norm = jnp.linalg.norm(v) + 1e-8
         u = v / v_norm
@@ -253,7 +272,9 @@ def generate_random_track(
         # sample obstacle pos
         flat_mask = mask_corridors.reshape(-1)
         total = flat_mask.sum()
-        p = jnp.where(total > 0, flat_mask / total, jnp.ones_like(flat_mask) / flat_mask.size)
+        p = jnp.where(
+            total > 0, flat_mask / total, jnp.ones_like(flat_mask) / flat_mask.size
+        )
         idx = jax.random.choice(sub_obs, flat_mask.shape[0], p=p)
         chosen_center = coords_flat[idx]
 

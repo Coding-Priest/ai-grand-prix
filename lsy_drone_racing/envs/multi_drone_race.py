@@ -10,7 +10,11 @@ from gymnasium.vector import VectorEnv
 from gymnasium.vector.utils import batch_space
 from packaging.version import Version
 
-from lsy_drone_racing.envs.race_core import RaceCoreEnv, build_action_space, build_observation_space
+from lsy_drone_racing.envs.race_core import (
+    RaceCoreEnv,
+    build_action_space,
+    build_observation_space,
+)
 
 if TYPE_CHECKING:
     from jax import Array
@@ -40,6 +44,7 @@ class MultiDroneRaceEnv(RaceCoreEnv, Env):
         seed: str | int = "random",
         max_episode_steps: int = 1500,
         device: Literal["cpu", "gpu"] = "cpu",
+        **kwargs,
     ):
         """Initialize the multi-agent drone racing environment.
 
@@ -56,7 +61,11 @@ class MultiDroneRaceEnv(RaceCoreEnv, Env):
             max_episode_steps: Maximum number of steps per episode.
             device: Device used for the environment and the simulation.
         """
-        n_gates, n_obstacles, n_drones = len(track.gates), len(track.obstacles), len(track.drones)
+        n_gates, n_obstacles, n_drones = (
+            len(track.gates),
+            len(track.obstacles),
+            len(track.drones),
+        )
         super().__init__(
             n_envs=1,
             n_drones=n_drones,
@@ -70,16 +79,21 @@ class MultiDroneRaceEnv(RaceCoreEnv, Env):
             seed=seed,
             max_episode_steps=max_episode_steps,
             device=device,
+            disable_termination=kwargs.get("disable_termination", False),
+            disable_collisions=kwargs.get("disable_collisions", False),
         )
         self.action_space = batch_space(
             build_action_space(control_mode, sim_config.drone_model), n_drones
         )
         self.observation_space = batch_space(
-            build_observation_space(n_gates, n_obstacles), n_drones
+            build_observation_space(n_gates, n_obstacles, self.imu_steps_per_env),
+            n_drones,
         )
         self.autoreset = False
 
-    def reset(self, seed: int | None = None, options: dict | None = None) -> tuple[dict, dict]:
+    def reset(
+        self, seed: int | None = None, options: dict | None = None
+    ) -> tuple[dict, dict]:
         """Reset the environment for all drones.
 
         Args:
@@ -117,7 +131,9 @@ class VecMultiDroneRaceEnv(RaceCoreEnv, VectorEnv):
     This environment enables vectorized training of multi-agent drone racing agents.
     """
 
-    metadata = {"autoreset_mode": AutoresetMode.NEXT_STEP if AutoresetMode is not None else None}
+    metadata = {
+        "autoreset_mode": AutoresetMode.NEXT_STEP if AutoresetMode is not None else None
+    }
 
     def __init__(
         self,
@@ -132,6 +148,7 @@ class VecMultiDroneRaceEnv(RaceCoreEnv, VectorEnv):
         seed: int = 1337,
         max_episode_steps: int = 1500,
         device: Literal["cpu", "gpu"] = "cpu",
+        **kwargs,
     ):
         """Vectorized multi-agent drone racing environment.
 
@@ -148,7 +165,11 @@ class VecMultiDroneRaceEnv(RaceCoreEnv, VectorEnv):
             max_episode_steps: Maximum number of steps per episode.
             device: Device used for the environment and the simulation.
         """
-        n_gates, n_obstacles, n_drones = len(track.gates), len(track.obstacles), len(track.drones)
+        n_gates, n_obstacles, n_drones = (
+            len(track.gates),
+            len(track.obstacles),
+            len(track.drones),
+        )
         super().__init__(
             n_envs=num_envs,
             n_drones=n_drones,
@@ -162,6 +183,8 @@ class VecMultiDroneRaceEnv(RaceCoreEnv, VectorEnv):
             seed=seed,
             max_episode_steps=max_episode_steps,
             device=device,
+            disable_termination=kwargs.get("disable_termination", False),
+            disable_collisions=kwargs.get("disable_collisions", False),
         )
         self.num_envs = num_envs
         self.single_action_space = batch_space(
@@ -169,11 +192,14 @@ class VecMultiDroneRaceEnv(RaceCoreEnv, VectorEnv):
         )
         self.action_space = batch_space(batch_space(self.single_action_space), num_envs)
         self.single_observation_space = batch_space(
-            build_observation_space(n_gates, n_obstacles), n_drones
+            build_observation_space(n_gates, n_obstacles, self.imu_steps_per_env),
+            n_drones,
         )
         self.observation_space = batch_space(self.single_observation_space, num_envs)
 
-    def reset(self, seed: int | None = None, options: dict | None = None) -> tuple[dict, dict]:
+    def reset(
+        self, seed: int | None = None, options: dict | None = None
+    ) -> tuple[dict, dict]:
         """Reset the environment for all drones.
 
         Args:

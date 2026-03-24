@@ -103,6 +103,9 @@ class EnvData:
     max_episode_steps: Array
     sensor_range: Array
     last_drone_vel: Array
+    accel_buffer: Array
+    gyro_buffer: Array
+    last_target_gate: Array
 
     @classmethod
     def create(
@@ -120,6 +123,7 @@ class EnvData:
         pos_limit_high: Array,
         device: Device,
         last_drone_vel: Array,
+        imu_steps_per_env: int,
     ) -> EnvData:
         """Create a new environment data struct with default values."""
         return cls(
@@ -147,6 +151,17 @@ class EnvData:
                 jp.array(last_drone_vel, dtype=np.float32, device=device),
                 (n_envs, n_drones, 1),
             ),
+            accel_buffer=jp.zeros(
+                (n_envs, n_drones, imu_steps_per_env, 3),
+                dtype=np.float32,
+                device=device,
+            ),
+            gyro_buffer=jp.zeros(
+                (n_envs, n_drones, imu_steps_per_env, 3),
+                dtype=np.float32,
+                device=device,
+            ),
+            last_target_gate=jp.zeros((n_envs, n_drones), dtype=int, device=device),
         )
 
 
@@ -178,7 +193,9 @@ def build_action_space(
         raise ValueError(f"Invalid control mode: {control_mode}")
 
 
-def build_observation_space(n_gates: int, n_obstacles: int) -> spaces.Dict:
+def build_observation_space(
+    n_gates: int, n_obstacles: int, imu_steps_per_env: int
+) -> spaces.Dict:
     """Create the observation space for the environment.
 
     The observation space is a dictionary containing the drone state, gate information,
@@ -193,6 +210,8 @@ def build_observation_space(n_gates: int, n_obstacles: int) -> spaces.Dict:
         "quat": spaces.Box(low=-1, high=1, shape=(4,)),
         "vel": spaces.Box(low=-np.inf, high=np.inf, shape=(3,)),
         "ang_vel": spaces.Box(low=-np.inf, high=np.inf, shape=(3,)),
+        "accel": spaces.Box(low=-np.inf, high=np.inf, shape=(imu_steps_per_env, 3)),
+        "gyro": spaces.Box(low=-np.inf, high=np.inf, shape=(imu_steps_per_env, 3)),
         "target_gate": spaces.Discrete(n_gates, start=-1),
         "gates_pos": spaces.Box(low=-np.inf, high=np.inf, shape=(n_gates, 3)),
         "gates_quat": spaces.Box(low=-1, high=1, shape=(n_gates, 4)),
@@ -263,8 +282,10 @@ class RaceCoreEnv:
         disturbances: ConfigDict | None = None,
         randomizations: ConfigDict | None = None,
         seed: str | int = "random",
-        max_episode_steps: int = 1500,
+        max_episode_steps: int = 1000,
         device: Literal["cpu", "gpu"] = "cpu",
+        disable_termination: bool = False,
+        disable_collisions: bool = True,
     ):
         """Initialize the DroneRacingEnv.
 
@@ -309,12 +330,30 @@ class RaceCoreEnv:
             "lookat": sim_config.camera_view[3:],
         }
 
+        self.disable_termination = disable_termination
+        self.disable_collisions = disable_collisions
+
         # Sanitize args
         if sim_config.freq % freq != 0:
             raise ValueError(f"({sim_config.freq=}) is no multiple of ({freq=})")
 
         # Env settings
         self.freq = freq
+        self.imu_freq = sim_config.get("imu_freq", 500)  # Default to 500Hz
+
+        # Ensure frequencies divide cleanly
+        if self.sim.freq % self.imu_freq != 0:
+            raise ValueError(
+                f"Simulation freq ({self.sim.freq}) must be a multiple of IMU freq ({self.imu_freq})"
+            )
+        if self.imu_freq % self.freq != 0:
+            raise ValueError(
+                f"IMU freq ({self.imu_freq}) must be a multiple of Env/SLAM freq ({self.freq})"
+            )
+
+        self.sim_steps_per_imu = self.sim.freq // self.imu_freq
+        self.imu_steps_per_env = self.imu_freq // self.freq
+
         self.seed = seed
         self.autoreset = True  # Can be overridden by subclasses
         self.device = jax.devices(device)[0]
@@ -331,7 +370,9 @@ class RaceCoreEnv:
 
         # Create the environment data struct.
         n_gates, n_obstacles = len(track.gates), len(track.obstacles)
-        contact_masks = self._load_contact_masks(self.sim)
+        contact_masks = self._load_contact_masks(
+            self.sim, disable_collisions=disable_collisions
+        )
         m = self.sim.mj_model
         gate_ids = [int(m.body(f"gate:{i}").mocapid.squeeze()) for i in range(n_gates)]
         obstacle_ids = [
@@ -351,6 +392,7 @@ class RaceCoreEnv:
             pos_limit_high=[3, 3, 2.5],
             device=self.device,
             last_drone_vel=self.drone["vel"],
+            imu_steps_per_env=self.imu_steps_per_env,
         )
         self.randomize_track = build_track_randomization_fn(
             randomizations, gate_ids, obstacle_ids
@@ -413,8 +455,8 @@ class RaceCoreEnv:
             data: SimData, mjx_data: Data, key: jax.random.PRNGKey
         ) -> tuple[SimData, Data]:
             # Randomized drone pos
-            pos = data.states.pos.at[...].set(self.drone["pos"])
-            data = data.replace(states=data.states.replace(pos=pos))
+            # pos = data.states.pos.at[...].set(self.drone["pos"])
+            # data = data.replace(states=data.states.replace(pos=pos))
 
             mjx_data = self.randomize_track(
                 mjx_data,
@@ -451,8 +493,42 @@ class RaceCoreEnv:
             action: Full-state command [x, y, z, vx, vy, vz, ax, ay, az, yaw, rrate, prate, yrate]
                 to follow.
         """
+        # Check if the physics engine is registering ANY contacts at all
+
         self.apply_action(action)
-        self.sim.step(self.sim.freq // self.freq)
+
+        accel_list = []
+        gyro_list = []
+        dt_imu = 1.0 / self.imu_freq
+        last_vel_for_imu = self.data.last_drone_vel
+
+        # Step the physics engine in smaller chunks to gather IMU data
+        for _ in range(self.imu_steps_per_env):
+            self.sim.step(self.sim_steps_per_imu)
+
+            current_vel = self.sim.data.states.vel
+            current_quat = self.sim.data.states.quat
+            current_ang_vel = self.sim.data.states.ang_vel
+
+            # Compute IMU for this specific micro-step
+            accel, gyro = self.compute_imu(
+                current_vel=current_vel,
+                last_vel=last_vel_for_imu,
+                current_quat=current_quat,
+                current_ang_vel=current_ang_vel,
+                dt=dt_imu,
+            )
+
+            accel_list.append(accel)
+            gyro_list.append(gyro)
+            last_vel_for_imu = current_vel
+
+        self.data = self.data.replace(
+            accel_buffer=jp.stack(accel_list, axis=-2),
+            gyro_buffer=jp.stack(gyro_list, axis=-2),
+        )
+
+        # self.sim.step(self.sim.freq // self.freq)
         # Warp drones that have crashed outside the track to prevent them from interfering with
         # other drones still in the race
         self.sim.data = self._warp_disabled_drones(
@@ -467,6 +543,13 @@ class RaceCoreEnv:
             self.sim.mjx_data.mocap_quat,
         )
         contacts = self.sim.contacts()
+        import jax
+
+        contact_dists = self.sim.mjx_data.contact.dist
+        active_contacts = jp.sum(contact_dists <= 0.0, axis=-1)
+        jax.debug.print("Active contacts per world: {}", active_contacts)
+        jax.debug.print("Disabled drones flag: {}", self.data.disabled_drones)
+        # ----------------------------------
         # Get marked_for_reset before it is updated, because the autoreset needs to be based on the
         # previous flags, not the ones from the current step
         marked_for_reset = self.data.marked_for_reset
@@ -479,16 +562,24 @@ class RaceCoreEnv:
             mocap_quat,
             contacts,
             self.sim.freq,
+            stay_on_last=self.disable_termination,
         )
         # Auto-reset envs. Add configuration option to disable for single-world envs
+        step_reward = self.reward()
+        step_terminated = self.terminated()
+        step_truncated = self.truncated()
+        step_info = self.info()
+
+        # Auto-reset envs
         if self.autoreset and marked_for_reset.any():
             self._reset(mask=marked_for_reset)
+
         return (
-            self.obs(),
-            self.reward(),
-            self.terminated(),
-            self.truncated(),
-            self.info(),
+            self.obs(),  # Observation is from AFTER reset (Correct for Gym API)
+            step_reward,  # Reward is from BEFORE reset (The actual crash)
+            step_terminated,  # Flags are from BEFORE reset
+            step_truncated,
+            step_info,
         )
 
     def apply_action(self, action: Array):
@@ -539,23 +630,23 @@ class RaceCoreEnv:
             self.obstacles["nominal_pos"],
         )
 
-        # Calculate IMU values
-        dt = 1.0 / self.freq
-        accel, gyro = self.compute_imu(
-            current_vel=self.sim.data.states.vel,
-            last_vel=self.data.last_drone_vel,
-            current_quat=self.sim.data.states.quat,
-            current_ang_vel=self.sim.data.states.ang_vel,
-            dt=dt,
-        )
+        # # Calculate IMU values
+        # dt = 1.0 / self.freq
+        # accel, gyro = self.compute_imu(
+        #     current_vel=self.sim.data.states.vel,
+        #     last_vel=self.data.last_drone_vel,
+        #     current_quat=self.sim.data.states.quat,
+        #     current_ang_vel=self.sim.data.states.ang_vel,
+        #     dt=dt,
+        # )
 
         obs = {
             "pos": self.sim.data.states.pos,
             "quat": self.sim.data.states.quat,
             "vel": self.sim.data.states.vel,
             "ang_vel": self.sim.data.states.ang_vel,
-            "accel": accel,
-            "gyro": gyro,
+            "accel": self.data.accel_buffer,  # Now returns the full batch of readings
+            "gyro": self.data.gyro_buffer,
             "target_gate": self.data.target_gate,
             "gates_pos": gates_pos,
             "gates_quat": gates_quat,
@@ -566,17 +657,199 @@ class RaceCoreEnv:
         return obs
 
     def reward(self) -> Array:
-        """Compute the reward for the current state.
+        """Compute the composite reward for the vectorized environment."""
+        n_gates = len(self.data.gate_mj_ids)
+        target_idx = jp.maximum(self.data.last_target_gate, 0)
 
-        Note:
-            The current sparse reward function will most likely not work directly for training an
-            agent. If you want to use reinforcement learning, you will need to define your own
-            reward function.
+        # 1. Identify Phase
+        is_hover_phase = target_idx == (n_gates - 1)
 
-        Returns:
-            Reward for the current state.
-        """
-        return -1.0 * (self.data.target_gate == -1)  # Implicit float conversion
+        # Get positions
+        gate_ids = self.data.gate_mj_ids[target_idx % n_gates]
+        mocap_pos = self.sim.mjx_data.mocap_pos
+        current_gate_pos = mocap_pos[jp.arange(self.sim.n_worlds)[:, None], gate_ids]
+        drone_pos = self.sim.data.states.pos
+
+        # Calculate distances
+        dist_old = jp.linalg.norm(self.data.last_drone_pos - current_gate_pos, axis=-1)
+        dist_new = jp.linalg.norm(drone_pos - current_gate_pos, axis=-1)
+
+        # Get velocities
+        drone_vel = self.sim.data.states.vel
+        vel_mag = jp.linalg.norm(drone_vel, axis=-1)
+        ang_vel = self.sim.data.states.ang_vel
+
+        # Determine active status
+        is_active = ~self.data.disabled_drones
+
+        # ==========================================
+        # PHASE A: NAVIGATION REWARDS
+        # ==========================================
+        # 1. Passage Reward (+10.0 per gate)
+        gate_passed = (self.data.target_gate > self.data.last_target_gate) & (
+            self.data.target_gate != -1
+        )
+        reward_pass = jp.where(~is_hover_phase & is_active, 10.0 * gate_passed, 0.0)
+
+        # 2. Progress Reward (Scaled down to prevent dominating the gate pass)
+        progress = dist_old - dist_new
+        reward_prog = jp.where(~is_hover_phase, 5.0 * progress, 0.0)
+
+        # 3. Time Penalty (Push it to fly fast)
+        reward_time = jp.where(~is_hover_phase, -0.01, 0.0)
+
+        # ==========================================
+        # PHASE B: HOVER REWARDS
+        # ==========================================
+        # 1. The "Reach" Bonus (+5.0 once for entering the zone)
+        just_reached_hover = (dist_new < 0.2) & (dist_old >= 0.2)
+        reward_reach = jp.where(
+            is_hover_phase & is_active, 5.0 * just_reached_hover, 0.0
+        )
+
+        # 2. The "Magnet" Reward (+0.1 max per step -> +5.0 per sec at 50Hz)
+        alpha = 5.0
+        hover_magnet = jp.exp(-alpha * (dist_new**2))
+
+        # 3. The "Brake" Penalty
+        hover_brake = -0.05 * vel_mag
+
+        reward_hover = jp.where(is_hover_phase, (0.1 * hover_magnet) + hover_brake, 0.0)
+
+        # ==========================================
+        # UNIVERSAL PENALTIES (Active in all phases)
+        # ==========================================
+        reward_smooth = -0.005 * jp.linalg.norm(ang_vel, axis=-1)
+
+        # Soft Boundary Penalty
+        threshold = 0.05
+        dist_to_low = drone_pos - self.data.pos_limit_low
+        dist_to_high = self.data.pos_limit_high - drone_pos
+        in_danger_zone = jp.any(dist_to_low < threshold, axis=-1) | jp.any(
+            dist_to_high < threshold, axis=-1
+        )
+        reward_boundary = -0.5 * in_danger_zone
+
+        # Crash Penalty (Only apply ONCE on the exact frame it becomes disabled)
+        # Assuming you have access to `marked_for_reset` or similar to check the transition.
+        # If not, we just apply a flat -10.0 when it dies.
+        just_died = self.data.disabled_drones & is_active  # Transition check
+        reward_crash = -10.0 * just_died
+
+        # ==========================================
+        # FINAL SUMMATION & SCALING
+        # ==========================================
+        # Only accumulate dense continuous rewards while the drone is actually alive
+        dense_rewards = jp.where(
+            is_active,
+            reward_prog + reward_time + reward_hover + reward_smooth + reward_boundary,
+            0.0,
+        )
+
+        total_reward = reward_pass + reward_reach + reward_crash + dense_rewards
+
+        # GLOBAL SCALER: Bring everything down to a neural-network-friendly [-1, 1] range.
+        scaled_reward = total_reward / 10.0
+
+        return scaled_reward
+
+    # def reward(self) -> Array:
+    #     """Compute the composite reward for the vectorized environment."""
+
+    #     # 0. Identify the Current Phase (Navigating vs Hovering)
+    #     n_gates = len(self.data.gate_mj_ids)
+    #     target_idx = jp.maximum(self.data.last_target_gate, 0)
+
+    #     # Create a boolean mask: True if this specific environment is on the final waypoint
+    #     is_last_gate = target_idx == (n_gates - 1)
+
+    #     # 1. Gate Passage Reward
+    #     # This still fires for intermediate gates
+    #     gate_passed = (self.data.target_gate > self.data.last_target_gate) & (
+    #         self.data.target_gate != -1
+    #     )
+    #     reward_pass = 100.0 * gate_passed
+
+    #     # 2. Crash / Termination Penalty
+    #     # (Keeping this active in case boundary hits or other logic still disables drones)
+    #     reward_crash = -50.0 * self.data.disabled_drones
+
+    #     # 3. Distance Calculations
+    #     gate_ids = self.data.gate_mj_ids[target_idx % n_gates]
+    #     mocap_pos = self.sim.mjx_data.mocap_pos
+    #     current_gate_pos = mocap_pos[jp.arange(self.sim.n_worlds)[:, None], gate_ids]
+
+    #     drone_pos = self.sim.data.states.pos
+    #     dist_old = jp.linalg.norm(self.data.last_drone_pos - current_gate_pos, axis=-1)
+    #     dist_new = jp.linalg.norm(drone_pos - current_gate_pos, axis=-1)
+
+    #     # 4. Phase-Dependent Position & Progress Rewards
+    #     # Progress (dist_old - dist_new) is great for racing, but equals 0 when hovering perfectly.
+    #     # Absolute distance penalty (-dist_new) is terrible for racing (too punitive), but perfect for hovering.
+    #     progress = dist_old - dist_new
+
+    #     reward_prog = jp.where(~is_last_gate, 10.0 * progress, 0.0)
+    #     reward_hover_pos = jp.where(is_last_gate, -5.0 * dist_new, 0.0)
+
+    #     # 5. NEW: Hover Velocity Penalty
+    #     # We must penalize speed heavily at the end so it learns to brake.
+    #     # (Assuming linear velocity is stored at self.sim.data.states.vel)
+    #     drone_vel = self.sim.data.states.vel
+    #     vel_mag = jp.linalg.norm(drone_vel, axis=-1)
+
+    #     # Apply a harsh -1.0 penalty multiplier only when at the final gate
+    #     reward_hover_vel = jp.where(is_last_gate, -1.0 * vel_mag, 0.0)
+
+    #     # 6. Smoothness Penalty (Active everywhere)
+    #     ang_vel = self.sim.data.states.ang_vel
+    #     reward_smooth = -0.01 * jp.linalg.norm(ang_vel, axis=-1)
+
+    #     # 7. Time Penalty
+    #     # If we leave the time penalty active while hovering, the agent accumulates infinite
+    #     # negative reward and might just fly out of bounds to escape. We turn it off at the end.
+    #     reward_time = jp.where(~is_last_gate, -0.05, 0.0)
+
+    #     # 8. Soft Boundary Penalty (Kept exact same as your logic)
+    #     threshold = 0.05
+    #     dist_to_low = drone_pos - self.data.pos_limit_low
+    #     dist_to_high = self.data.pos_limit_high - drone_pos
+
+    #     near_low = jp.any(dist_to_low < threshold, axis=-1)
+    #     near_high = jp.any(dist_to_high < threshold, axis=-1)
+    #     in_danger_zone = near_low | near_high
+
+    #     reward_boundary = -5.0 * in_danger_zone
+
+    #     drone_z = self.sim.data.states.pos[..., 2]
+
+    #     # Define a "floor threshold" (e.g., z < 0.05)
+    #     floor_threshold = 0.05
+    #     hit_ground = drone_z < floor_threshold
+
+    #     # Apply a heavy penalty for hitting the ground, EVEN IF collisions are disabled
+    #     reward_ground_collision = -50.0 * hit_ground
+
+    #     # Combine dense rewards...
+    #     is_active = ~self.data.disabled_drones
+
+    #     # Combine dense rewards and mask them out if the drone is disabled
+    #     is_active = ~self.data.disabled_drones
+    #     dense_rewards = jp.where(
+    #         is_active,
+    #         reward_prog
+    #         + reward_hover_pos
+    #         + reward_hover_vel
+    #         + reward_smooth
+    #         + reward_time
+    #         + reward_boundary
+    #         + reward_ground_collision,
+    #         0.0,
+    #     )
+
+    #     # Total sum
+    #     total_reward = reward_pass + reward_crash + dense_rewards
+    #     total_reward = total_reward / 100.0
+    #     return total_reward
 
     def terminated(self) -> Array:
         """Check if the episode is terminated.
@@ -584,6 +857,8 @@ class RaceCoreEnv:
         Returns:
             True if all drones have been disabled, else False.
         """
+        # if self.disable_termination:
+        # return np.zeros_like(self.data.disabled_drones, dtype=bool)
         return self.data.disabled_drones
 
     def truncated(self) -> Array:
@@ -631,6 +906,8 @@ class RaceCoreEnv:
             mask[..., None, None], obstacles_visited, data.obstacles_visited
         )
         last_drone_vel = jp.where(mask[..., None, None], drone_vel, data.last_drone_vel)
+        accel_buffer = jp.where(mask[..., None, None, None], 0.0, data.accel_buffer)
+        gyro_buffer = jp.where(mask[..., None, None, None], 0.0, data.gyro_buffer)
 
         return data.replace(
             target_gate=target_gate,
@@ -643,6 +920,9 @@ class RaceCoreEnv:
                 mask, 0, data.marked_for_reset
             ),  # Unmark after env reset
             last_drone_vel=last_drone_vel,
+            accel_buffer=accel_buffer,  # Update state
+            gyro_buffer=gyro_buffer,  # Update state
+            last_target_gate=jp.where(mask[..., None], 0, data.last_target_gate),
         )
 
     @staticmethod
@@ -655,6 +935,7 @@ class RaceCoreEnv:
         mocap_quat: Array,
         contacts: Array,
         freq: int,
+        stay_on_last: bool = False,
     ) -> EnvData:
         """Step the environment data."""
         n_gates = len(data.gate_mj_ids)
@@ -677,8 +958,13 @@ class RaceCoreEnv:
             drone_pos, data.last_drone_pos, gate_pos, gate_quat, (0.45, 0.45)
         )
         # Update the target gate index. Increment by one if drones have passed a gate
-        target_gate = data.target_gate + passed * ~disabled_drones
-        target_gate = jp.where(target_gate >= n_gates, -1, target_gate)
+        new_target_idx = data.target_gate + passed * ~disabled_drones
+
+        target_gate = jp.where(
+            stay_on_last,
+            jp.clip(new_target_idx, 0, n_gates - 1),
+            jp.where(new_target_idx >= n_gates, -1, new_target_idx),
+        )
         steps = data.steps + 1
         truncated = steps >= data.max_episode_steps
         marked_for_reset = jp.all(disabled_drones | truncated[..., None], axis=-1)
@@ -701,6 +987,7 @@ class RaceCoreEnv:
             gates_visited=gates_visited,
             obstacles_visited=obstacles_visited,
             steps=steps,
+            last_target_gate=data.target_gate,
         )
         return data
 
@@ -737,6 +1024,7 @@ class RaceCoreEnv:
     def _disabled_drones(pos: Array, contacts: Array, data: EnvData) -> Array:
         disabled = data.disabled_drones | jp.any(pos < data.pos_limit_low, axis=-1)
         disabled = disabled | jp.any(pos > data.pos_limit_high, axis=-1)
+
         disabled = disabled | (data.target_gate == -1)
         contacts = jp.any(contacts[:, None, :] & data.contact_masks, axis=-1)
         disabled = disabled | contacts
@@ -758,31 +1046,22 @@ class RaceCoreEnv:
         current_ang_vel: Array,
         dt: float,
     ) -> tuple[Array, Array]:
-        """Calculates accelerometer and gyroscope readings in the body frame.
-
-        Returns:
-            accel_body: Proper acceleration in body frame (m/s^2)
-            gyro_body: Angular velocity in body frame (rad/s)
-        """
         # --- Accelerometer ---
         # 1. Kinematic acceleration (World Frame)
         accel_world = (current_vel - last_vel) / dt
 
         # 2. Add gravity (World Frame)
-        # To read 9.81 on the Z-axis when resting, we add the gravity vector
         gravity = jp.array([0.0, 0.0, 9.81])
         proper_accel_world = accel_world + gravity
 
         # 3. Rotate to Body Frame
-        # current_quat is Body-to-World. We need World-to-Body, so we use the conjugate.
         q_inv = RaceCoreEnv._quat_conjugate(current_quat)
         accel_body = RaceCoreEnv._rotate_vector(q_inv, proper_accel_world)
 
         # --- Gyroscope ---
-        # NOTE: Check your MuJoCo configuration. If `current_ang_vel` is ALREADY
-        # extracted in the local body frame by your Sim wrapper, you can skip this rotation.
-        # Assuming it is in the World frame:
-        gyro_body = RaceCoreEnv._rotate_vector(q_inv, current_ang_vel)
+        # MuJoCo's qvel provides angular velocity ALREADY in the local body frame.
+        # We do not need to rotate it!
+        gyro_body = current_ang_vel
 
         return accel_body, gyro_body
 
@@ -842,24 +1121,42 @@ class RaceCoreEnv:
         self.sim.build_mjx()
 
     @staticmethod
-    def _load_contact_masks(sim: Sim) -> Array:  # , data: EnvData
+    def _load_contact_masks(sim: Sim, disable_collisions: bool = False) -> Array:
         """Load contact masks for the simulation that zero out irrelevant contacts per drone."""
+
         sim.contacts()  # Trigger initial contact information computation
         contact = sim.mjx_data._impl.contact
         n_contacts = len(contact.geom1[0])
         masks = np.zeros((sim.n_drones, n_contacts), dtype=bool)
-        # We only need one world to create the mask
+
         geom1, geom2 = (contact.geom1[0], contact.geom2[0])
+
+        # 1. Unconditionally identify the "world" (ground) geoms
+        world_id = sim.mj_model.body("world").id
+        w_start = sim.mj_model.body_geomadr[world_id]
+        w_count = sim.mj_model.body_geomnum[world_id]
+
+        world_active = (geom1 >= w_start) & (geom1 < w_start + w_count) | (
+            geom2 >= w_start
+        ) & (geom2 < w_start + w_count)
+
         for i in range(sim.n_drones):
-            geom_start = sim.mj_model.body_geomadr[sim.mj_model.body(f"drone:{i}").id]
-            geom_count = sim.mj_model.body_geomnum[sim.mj_model.body(f"drone:{i}").id]
-            geom1_valid = (geom1 >= geom_start) & (geom1 < geom_start + geom_count)
-            geom2_valid = (geom2 >= geom_start) & (geom2 < geom_start + geom_count)
-            masks[i, :] = geom1_valid | geom2_valid
-        geom_start = sim.mj_model.body_geomadr[sim.mj_model.body("world").id]
-        geom_count = sim.mj_model.body_geomnum[sim.mj_model.body("world").id]
-        geom1_valid = (geom1 >= geom_start) & (geom1 < geom_start + geom_count)
-        geom2_valid = (geom2 >= geom_start) & (geom2 < geom_start + geom_count)
+            drone_id = sim.mj_model.body(f"drone:{i}").id
+            d_start = sim.mj_model.body_geomadr[drone_id]
+            d_count = sim.mj_model.body_geomnum[drone_id]
+
+            # 2. Unconditionally identify geoms belonging to THIS drone
+            drone_active = (geom1 >= d_start) & (geom1 < d_start + d_count) | (
+                geom2 >= d_start
+            ) & (geom2 < d_start + d_count)
+
+            # 3. Apply the conditional logic for the mask
+            if disable_collisions:
+                # If collisions are "disabled", ONLY allow Drone <-> Floor collisions
+                masks[i, :] = drone_active & world_active
+            else:
+                # If collisions are enabled, allow the Drone to collide with ANYTHING
+                masks[i, :] = drone_active
 
         masks = np.tile(masks[None, ...], (sim.n_worlds, 1, 1))
         return masks

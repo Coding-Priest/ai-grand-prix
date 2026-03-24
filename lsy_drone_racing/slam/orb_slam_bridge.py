@@ -1,24 +1,33 @@
-import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import Image
-from cv_bridge import CvBridge
 import cv2 as cv
+import zmq
+import time
+import struct
 
 
-class OrbSlamBridge(Node):
+class OrbSlamBridge:
 
     def __init__(self):
-        super().__init__("drone_sim_bridge")
 
-        self.publisher_ = self.create_publisher(Image, "/camera/image_raw", 10)
-        self.bridge = CvBridge()
+        context = zmq.Context()
+        self.zmq_socket = context.socket(zmq.PUB)
 
-    def publish_frame(self, frame):
+        # "127.0.0.1" is your own computer (localhost)
+        self.zmq_socket.bind("tcp://127.0.0.1:5555")
+
+    def publish_frame(self, frame, curr_time=None):
 
         if frame is None:
-            self.get_logger().warn("Blank Frame Passed")
             return
 
-        msg = self.bridge.cv_to_imgmsg(cv_image, encoding="bgr8")
+        # print(type(frame))
+        # exit()
+        success, encoded_image = cv.imencode(".jpg", frame)
 
-        self.publisher_.publish(msg)
+        if not success:
+            return
+
+        image_bytes = encoded_image.tobytes()
+
+        time_bytes = struct.pack("d", time.time())
+
+        self.zmq_socket.send_multipart([time_bytes, image_bytes])

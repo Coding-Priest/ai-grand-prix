@@ -21,3 +21,5 @@ c_generated_code/
 !.pixi/config.toml
 ros_ws/
 acados/
+
+**.bin

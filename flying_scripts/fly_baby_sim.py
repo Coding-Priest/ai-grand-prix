@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import fire
 import gymnasium
@@ -18,17 +19,30 @@ import jax.numpy as jp
 import numpy as np
 from gymnasium.wrappers.jax_to_numpy import JaxToNumpy
 
-from lsy_drone_racing.envs.drone_race import DroneRaceEnv
-from lsy_drone_racing.utils import load_config, load_controller
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+import numpy as np
 
-# from lsy_drone_racing.slam.orb_slam_bridge import OrbSlamBridge
-import cv2 as cv
+from lsy_drone_racing.utils import load_config, load_controller
+from .visualize import VisualizeSim
+from .rollout_buffer import RolloutBuffer
+from models.droneac import DroneActorCritic
+
+
+if TYPE_CHECKING:
+    from ml_collections import ConfigDict
+
+    from lsy_drone_racing.control.controller import Controller
+    from lsy_drone_racing.envs.drone_race import DroneRaceEnv
+
 
 logger = logging.getLogger(__name__)
 
+# sim_visualizer = VisualizeSim()
+
 
 def simulate(
-    config: str = "level0_slam_start.toml",
+    config: str = "level0_baby_steps.toml",
     controller: str | None = None,
     n_runs: int = 1,
     render: bool | None = None,
@@ -67,15 +81,13 @@ def simulate(
         track=config.env.track,
         disturbances=config.env.get("disturbances"),
         randomizations=config.env.get("randomizations"),
+        max_episode_steps=350,
         seed=config.env.seed,
+        disable_termination=False,
+        disable_collisions=False,
     )
-    env = JaxToNumpy(env)
 
-    # node = OrbSlamBridge()
-    # fps = 30
-    # width, height = 1920, 1080  # Match your env dimensions
-    # fourcc = cv.VideoWriter_fourcc(*"mp4v")
-    # video_writer = cv.VideoWriter("drone_fly.mp4", fourcc, fps, (width, height))
+    env = JaxToNumpy(env)
 
     ep_times = []
     for _ in range(n_runs):  # Run n_runs episodes with the controller
@@ -93,20 +105,28 @@ def simulate(
 
             obs, reward, terminated, truncated, info = env.step(action)
 
-            # What is even the point of this?
+            if terminated:
+                print("Terminated from source")
+
+            # if reward > 0:
+            print("Reward: ", reward * 100)
+            # print("Target Gate:", obs["target_gate"])
+
             # Update the controller internal state and models.
             controller_finished = controller.step_callback(
                 action, obs, reward, terminated, truncated, info
             )
+            controller_finished = False
+
             # Add up reward, collisions
             if terminated or truncated or controller_finished:
+                print(terminated, truncated, controller_finished)
                 break
-
-            frame = obs["camera_frame"]
-
             if config.sim.render:  # Render the sim if selected.
                 if ((i * fps) % config.env.freq) < fps:
                     env.render()
+                    # sim_visualizer.plot_obs(obs)
+
             i += 1
 
         controller.episode_callback()  # Update the controller internal state and models.
