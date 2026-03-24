@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any, Literal
 
 import fire
+from functools import partial
+
 import gymnasium as gym
 import jax
 import jax.numpy as jp
@@ -53,13 +55,13 @@ class Args:
     """the entity (team) of wandb's project"""
 
     # Algorithm specific arguments
-    total_timesteps: int = 150_000_000
+    total_timesteps: int = 1_500_000_000
     """total timesteps of the experiments"""
     learning_rate: float = 3e-4
     """the learning rate of the optimizer"""
     num_envs: int = 512
     """the number of parallel game environments"""
-    num_steps: int = 2048
+    num_steps: int = 512
     """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
     """Toggle learning rate annealing for policy and value networks"""
@@ -105,6 +107,7 @@ class Args:
     d_act_xy_coef: float = 0.01
     act_coef: float = 0.01
     look_at_coef: float = 0.01
+    alive_coef: float = 1
     global_scale = 0.01
     """reward coefficients for training"""
 
@@ -125,30 +128,32 @@ class RaceTrainEnv(VecDroneRaceEnv):
         rpy (3)                 – roll, pitch, yaw of the drone (radians)
         vel_body (3)            – velocity in the drone's body frame
         ang_vel (3)             – angular velocity in the world frame
-        dist_target (1)         – exponential distance to target: 2*exp(-2*dist)-1 (mapped to [-1, 1])
-        dist_next (1)           – exponential distance to next gate: 2*exp(-2*dist)-1 (mapped to [-1, 1])
+        dist_target (1)         – distance to target gate (meters)
+        dist_next (1)           – distance to next gate (meters)
         gate_vec_body (3)       – unit vector from drone to target gate in body frame (range [-1, 1])
         gate_alignment (1)      – angle between target gate's normal and drone yaw
         gate_vec_body_next (3)  – unit vector from drone to next gate in body frame (range [-1, 1])
         gate_alignment_next (1) – angle between next gate's normal and drone yaw
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, alive_coef: float = 0.1, **kwargs):
         """Init – delegates to parent then overrides the observation space."""
         super().__init__(**kwargs)
+        self.alive_coef = alive_coef
         self.autoreset = False  # Handle autoreset manually to fix termination swallowing
         self.prev_target_gate = self.data.target_gate[:, 0]
         self.segment_dist = jp.zeros((self.num_envs,))
         self.prev_dist = jp.zeros((self.num_envs,))
+        self.passed_counts = jp.zeros((self.num_envs,), dtype=jp.int32)
         obs_spec = {
             # Euler angles: always in [-pi, pi]
             "rpy":                 spaces.Box(-np.pi, np.pi,  shape=(3,), dtype=np.float32),
             # Velocities: CF2.1B hardware max ~2.5 m/s or rad/s; allow 5.0 for sim headroom
             "vel_body":            spaces.Box(-5.0,   5.0,    shape=(3,), dtype=np.float32),
             "ang_vel":             spaces.Box(-5.0,   5.0,    shape=(3,), dtype=np.float32),
-            # Exponential distances: 2*exp(-2*dist)-1 maps [0, inf) to [-1, 1]
-            "dist_target":         spaces.Box(-1.0, 1.0, shape=(1,), dtype=np.float32),
-            "dist_next":           spaces.Box(-1.0, 1.0, shape=(1,), dtype=np.float32),
+            # Distances to gates (meters)
+            "dist_target":         spaces.Box(0.0, 100.0, shape=(1,), dtype=np.float32),
+            "dist_next":           spaces.Box(0.0, 100.0, shape=(1,), dtype=np.float32),
             # Body-frame unit vector to gate: [x,y,z] components in [-1, 1]
             "gate_vec_body":       spaces.Box(-1.0,  1.0,   shape=(3,), dtype=np.float32),
             "gate_alignment":      spaces.Box(-np.pi, np.pi,  shape=(1,), dtype=np.float32),
@@ -160,84 +165,84 @@ class RaceTrainEnv(VecDroneRaceEnv):
         self.observation_space = batch_space(self.single_observation_space, self.num_envs)
 
     def obs(self) -> dict[str, Array]:
-        """Compact ego-centric observation.
-
-        All angles are in radians and wrapped to [-pi, pi].
-        The drone body frame uses: x=forward, y=left, z=up.
-        """
+        """Compact ego-centric observation."""
         base = super().obs()  # world-frame obs from RaceCoreEnv
+        
+        return self._compute_obs(
+            base["pos"][:, 0, :],
+            base["quat"][:, 0, :],
+            base["vel"][:, 0, :],
+            base["ang_vel"][:, 0, :],
+            base["gates_pos"][:, 0, :, :],
+            base["gates_quat"][:, 0, :, :],
+            base["target_gate"][:, 0],
+            len(self.gates["pos"]),
+            self.num_envs
+        )
 
-        # ── raw state ──────────────────────────────────────────────────────────
-        drone_pos  = base["pos"][:, 0, :]   # (N, 3)  world pos
-        drone_quat = base["quat"][:, 0, :]  # (N, 4)  scipy (x,y,z,w)
-        vel_world  = base["vel"][:, 0, :]   # (N, 3)  world-frame velocity
-        ang_vel_world = base["ang_vel"][:, 0, :] # (N, 3) world-frame angular velocity
-
-        body_R = R.from_quat(drone_quat)    # batch rotation object
-
+    @staticmethod
+    @partial(jax.jit, static_argnames=("n_gates", "num_envs"))
+    def _compute_obs(
+        drone_pos, drone_quat, vel_world, ang_vel_world,
+        gates_pos, gates_quat, target_gate, n_gates, num_envs
+    ):
+        """JIT-optimized observation computation."""
+        body_R = R.from_quat(drone_quat)
+        
         # 1. Roll / pitch / yaw
-        rpy = body_R.as_euler("xyz")        # (N, 3) radians
-        yaw = rpy[:, 2]                     # (N,)
+        rpy = body_R.as_euler("xyz")
+        yaw = rpy[:, 2]
 
         # 2. Velocity and Angular Velocity
-        vel_body = body_R.inv().apply(vel_world)  # (N, 3) body frame
-        ang_vel = base["ang_vel"][:, 0, :]        # (N, 3) world frame
-
+        vel_body = body_R.inv().apply(vel_world)
+        
         # ── gate geometry ──────────────────────────────────────────────────────
-        n_gates    = len(self.gates["pos"])
-        gates_pos  = base["gates_pos"][:, 0, :, :]   # (N, n_gates, 3)  squeeze drone dim
-        gates_quat = base["gates_quat"][:, 0, :, :]  # (N, n_gates, 4)
+        target_idx = jp.clip(target_gate, 0, n_gates - 1)
+        next_idx   = jp.clip(target_idx + 1, 0, n_gates - 1)
 
-        target_gate = base["target_gate"][:, 0]
-        target_idx = jp.clip(target_gate, 0, n_gates - 1)  # (N,)
-        next_idx   = jp.clip(target_idx + 1, 0, n_gates - 1)             # (N,) wraps at last gate
+        env_ids = jp.arange(num_envs)
+        target_gate_pos  = gates_pos[env_ids, target_idx]
+        next_gate_pos    = gates_pos[env_ids, next_idx]
+        target_gate_quat = gates_quat[env_ids, target_idx]
+        next_gate_quat   = gates_quat[env_ids, next_idx]
 
-        env_ids = jp.arange(self.num_envs)
-        target_gate_pos  = gates_pos[env_ids, target_idx]   # (N, 3)
-        next_gate_pos    = gates_pos[env_ids, next_idx]     # (N, 3)
-        target_gate_quat = gates_quat[env_ids, target_idx]  # (N, 4)
-        next_gate_quat   = gates_quat[env_ids, next_idx]    # (N, 4)
+        # 3. Distance to target gate and the one after it
+        dist_target = jp.linalg.norm(drone_pos - target_gate_pos, axis=-1, keepdims=True)
+        dist_next   = jp.linalg.norm(drone_pos - next_gate_pos,   axis=-1, keepdims=True)
+        
+        # 4. Unit vector to target and next gate in body frame
 
-        # 3. Exponential distance to target gate and the one after it: 2*exp(-2.0 * dist) - 1
-        #    This maps [0, inf) to [-1, 1]. Close = 1.0, Far = -1.0.
-        dist_target_raw = jp.linalg.norm(drone_pos - target_gate_pos, axis=-1, keepdims=True)
-        dist_next_raw   = jp.linalg.norm(drone_pos - next_gate_pos,   axis=-1, keepdims=True)
-        dist_target = 2.0 * jp.exp(-2.0 * dist_target_raw) - 1.0
-        dist_next   = 2.0 * jp.exp(-2.0 * dist_next_raw) - 1.0
-
-        # 4. Unit vector from drone to target and next gate expressed in the drone's body frame.
-        def get_gate_vec_body(target_pos):
-            vec_world = target_pos - drone_pos
-            vec_body_raw = body_R.inv().apply(vec_world)
+        def get_gate_vec_body(target_pos, d_pos, b_R_inv):
+            vec_world = target_pos - d_pos
+            vec_body_raw = b_R_inv.apply(vec_world)
             return vec_body_raw / (jp.linalg.norm(vec_body_raw, axis=-1, keepdims=True) + 1e-6)
 
-        gate_vec_body = get_gate_vec_body(target_gate_pos)
-        gate_vec_body_next = get_gate_vec_body(next_gate_pos)
+        gate_vec_body = get_gate_vec_body(target_gate_pos, drone_pos, body_R.inv())
+        gate_vec_body_next = get_gate_vec_body(next_gate_pos, drone_pos, body_R.inv())
 
-        # 5. Gate alignment: angle between gate's fly-through axis and drone yaw
-        #    The gate's local +x axis is its normal (the axis you fly along to pass through).
-        def get_gate_alignment(g_quat):
-            local_x     = jp.broadcast_to(jp.array([1.0, 0.0, 0.0]), (self.num_envs, 3))
-            gate_normal = R.from_quat(g_quat).apply(local_x)  # (N, 3)
-            gate_yaw    = jp.arctan2(gate_normal[:, 1], gate_normal[:, 0])  # (N,) world bearing
-            align_diff  = gate_yaw - yaw  # (N,)
-            return jp.arctan2(jp.sin(align_diff), jp.cos(align_diff))[:, None]  # (N, 1)
+        # 5. Gate alignment
+        def get_gate_alignment(g_quat, d_yaw):
+            local_x     = jp.array([1.0, 0.0, 0.0])
+            gate_normal = R.from_quat(g_quat).apply(local_x)
+            gate_yaw    = jp.arctan2(gate_normal[:, 1], gate_normal[:, 0])
+            align_diff  = gate_yaw - d_yaw
+            return jp.arctan2(jp.sin(align_diff), jp.cos(align_diff))[:, None]
 
-        gate_alignment = get_gate_alignment(target_gate_quat)
-        gate_alignment_next = get_gate_alignment(next_gate_quat)
+        gate_alignment = get_gate_alignment(target_gate_quat, yaw)
+        gate_alignment_next = get_gate_alignment(next_gate_quat, yaw)
 
-        # ── pack with drone dim so VecDroneRaceEnv.step() can squeeze with [:, 0] ──
         return {
-            "rpy":                 rpy[:, None, :],             # (N, 1, 3)
-            "vel_body":            vel_body[:, None, :],        # (N, 1, 3)
-            "ang_vel":             ang_vel[:, None, :],         # (N, 1, 3)
-            "dist_target":         dist_target_raw[:, None, :],     # (N, 1, 1)
-            "dist_next":           dist_next_raw[:, None, :],       # (N, 1, 1)
-            "gate_vec_body":       gate_vec_body[:, None, :],   # (N, 1, 3)
-            "gate_alignment":      gate_alignment[:, None, :],  # (N, 1, 1)
-            "gate_vec_body_next":  gate_vec_body_next[:, None, :],   # (N, 1, 3)
-            "gate_alignment_next": gate_alignment_next[:, None, :],  # (N, 1, 1)
+            "rpy":                 rpy[:, None, :],
+            "vel_body":            vel_body[:, None, :],
+            "ang_vel":             ang_vel_world[:, None, :],
+            "dist_target":         dist_target[:, None, :],
+            "dist_next":           dist_next[:, None, :],
+            "gate_vec_body":       gate_vec_body[:, None, :],
+            "gate_alignment":      gate_alignment[:, None, :],
+            "gate_vec_body_next":  gate_vec_body_next[:, None, :],
+            "gate_alignment_next": gate_alignment_next[:, None, :],
         }
+
 
     def _reset(self, mask: Array | None = None, **kwargs) -> tuple[dict, dict]:
         """Reset the environment and the target gate tracker."""
@@ -265,32 +270,32 @@ class RaceTrainEnv(VecDroneRaceEnv):
         obs, reward, terminated, truncated, info = super()._step(action)
         
         # 2. Fix Warping Lag: manually warp drones that just crashed in THIS step
-        # Note: reward/terminated already reflect the latest self.data
         self.sim.data = self._warp_disabled_drones(self.sim.data, self.data.disabled_drones)
 
-        # 3. Update tracker for reward calculation in NEXT step (using latest data)
-        target_gate = self.data.target_gate[:, 0]
-        passed = (target_gate > self.prev_target_gate) | (
-            (self.prev_target_gate == len(self.gates["pos"]) - 1) & (target_gate == -1)
+        # 3. JIT-optimized tracker update (No .any() sync points)
+        self.segment_dist, self.prev_target_gate, self.prev_dist, self.passed_counts = self._update_trackers(
+            self.data.target_gate[:, 0],
+            self.prev_target_gate,
+            self.sim.data.states.pos[:, 0, :],
+            self.sim.mjx_data.mocap_pos,
+            self.data.gate_mj_ids,
+            self.segment_dist,
+            self.prev_dist,
+            self._last_dist_raw,
+            self.data.marked_for_reset,
+            self.passed_counts,
+            len(self.gates["pos"]),
+            self.num_envs
         )
-        
-        if passed.any():
-            # Update segment_dist for the NEW target gate
-            drone_pos = self.sim.data.states.pos[:, 0, :]
-            n_gates = len(self.gates["pos"])
-            clamped = jp.clip(target_gate, 0, n_gates - 1)
-            gate_pos = self.sim.mjx_data.mocap_pos[jp.arange(self.num_envs), self.data.gate_mj_ids[clamped]]
-            new_dist = jp.linalg.norm(gate_pos - drone_pos, axis=-1)
-            # Only update for environments that just passed a gate
-            self.segment_dist = jp.where(passed, new_dist, self.segment_dist)
-
-        self.prev_target_gate = target_gate
-        mask = self.data.marked_for_reset
-        self.prev_dist = jp.where(mask, self.prev_dist, self._last_dist_raw)
 
         # 4. Manual autoreset: ensures we returned the terminal state BEFORE wiping it
-        if mask.any():
-            self._reset(mask=mask)
+        # Note: self._reset itself might have overhead, but we only call it when needed.
+        # However, to be fully JAX-optimized, we'd reset inside the JIT.
+        # For now, we keep the Python conditional to avoid unnecessary resets if possible,
+        # but we use a non-blocking check if we can. Actually, .any() is always blocking.
+        # If we want to be super fast, we should JIT the reset logic into the step.
+        if self.data.marked_for_reset.any():
+            self._reset(mask=self.data.marked_for_reset)
 
         # 5. Add reward components to info for logging
         if hasattr(self, "_last_reward_components"):
@@ -298,31 +303,70 @@ class RaceTrainEnv(VecDroneRaceEnv):
 
         return obs, reward, terminated, truncated, info
 
-    def reward(self) -> Array:
-        """Velocity-projection (progress) reward with gate-pass bonus.
-
-        reward = dot(vel, unit_vec_to_gate) + 100 * passed_gate
-
-        Positive when moving toward the gate, negative when drifting away,
-        Crash penalty = -10.0 when the drone is disabled.
-        """
-        n_gates = len(self.gates["pos"])
-        target_gate = self.data.target_gate[:, 0]
+    @staticmethod
+    @partial(jax.jit, static_argnames=("n_gates", "num_envs"))
+    def _update_trackers(
+        target_gate, prev_target_gate, drone_pos, mocap_pos, gate_mj_ids,
+        segment_dist, prev_dist, last_dist_raw, marked_for_reset, passed_counts,
+        n_gates, num_envs
+    ):
+        """JIT-optimized tracker updates without CPU sync."""
+        passed = (target_gate > prev_target_gate) | (
+            (prev_target_gate == n_gates - 1) & (target_gate == -1)
+        )
+        passed_counts = passed_counts + passed.astype(jp.int32)
+        
+        # Update segment_dist for environments that just passed a gate
+        env_ids = jp.arange(num_envs)
         clamped = jp.clip(target_gate, 0, n_gates - 1)
+        gate_pos = mocap_pos[env_ids, gate_mj_ids[clamped]]
+        new_dist = jp.linalg.norm(gate_pos - drone_pos, axis=-1)
+        
+        segment_dist = jp.where(passed, new_dist, segment_dist)
+        
+        # Update prev_dist based on marked_for_reset
+        prev_dist_val = jp.where(marked_for_reset, prev_dist, last_dist_raw)
+        
+        return segment_dist, target_gate, prev_dist_val, passed_counts
 
-        gate_pos = self.sim.mjx_data.mocap_pos[jp.arange(self.num_envs), self.data.gate_mj_ids[clamped]]
-        drone_pos = self.sim.data.states.pos[:, 0, :]  # (N, 3)  from state
-        drone_vel = self.sim.data.states.vel[:, 0, :]  # (N, 3)  from state — no prev needed
-        to_gate = gate_pos - drone_pos
-        dist_raw = jp.linalg.norm(to_gate, axis=-1, keepdims=False)
+    def reward(self) -> Array:
+        """Velocity-projection (progress) reward with gate-pass bonus."""
+        reward, components, dist_raw = self._compute_reward(
+            self.data.target_gate[:, 0],
+            self.prev_target_gate,
+            self.sim.data.states.pos[:, 0, :],
+            self.sim.data.states.vel[:, 0, :],
+            self.prev_dist,
+            self.sim.mjx_data.mocap_pos,
+            self.data.gate_mj_ids,
+            len(self.gates["pos"]),
+            self.num_envs,
+            self.data.disabled_drones[:, 0],
+            self.alive_coef
+        )
         self._last_dist_raw = dist_raw
+        self._last_reward_components = components
+        return reward
+
+    @staticmethod
+    @partial(jax.jit, static_argnames=("n_gates", "num_envs"))
+    def _compute_reward(
+        target_gate, prev_target_gate, drone_pos, drone_vel, prev_dist,
+        mocap_pos, gate_mj_ids, n_gates, num_envs, disabled_drones, alive_coef
+    ):
+        """JIT-optimized reward computation."""
+        clamped = jp.clip(target_gate, 0, n_gates - 1)
+        gate_pos = mocap_pos[jp.arange(num_envs), gate_mj_ids[clamped]]
+
+        to_gate = gate_pos - drone_pos
+        dist_raw = jp.linalg.norm(to_gate, axis=-1)
 
         # Progress reward: change in distance towards goal
-        progress = (self.prev_dist - dist_raw) * 100
+        progress = (prev_dist - dist_raw) * 100
         
         # Detect gate pass: target gate incremented OR reached end (target_gate == -1)
-        passed = (target_gate > self.prev_target_gate) | (
-            (self.prev_target_gate == n_gates - 1) & (target_gate == -1)
+        passed = (target_gate > prev_target_gate) | (
+            (prev_target_gate == n_gates - 1) & (target_gate == -1)
         )
         
         # Reset progress on gate pass to avoid massive reward jump from target change
@@ -330,21 +374,25 @@ class RaceTrainEnv(VecDroneRaceEnv):
         progress = jp.clip(progress, -1.0, 1.0)
 
         gate_reward = jp.where(passed, 100.0, 0.0)
-        reward = progress + gate_reward
-
-        disabled = self.data.disabled_drones[:, 0]
-        is_finished = target_gate == -1
-        # Crash penalty only if disabled but NOT finished. Return (N, 1) for VecDroneRaceEnv.
-        crash_penalty = jp.where(disabled & ~is_finished, -50.0, 0.0)
         
-        # Store components for info()
-        self._last_reward_components = {
+        is_finished = target_gate == -1
+        # Crash penalty only if disabled but NOT finished.
+        crash_penalty = jp.where(disabled_drones & ~is_finished, -50.0, 0.0)
+        
+        # Survival reward: small positive reward for each step the drone is alive and hasn't finished.
+        reward_alive = jp.where(~disabled_drones & ~is_finished, alive_coef, 0.0)
+        
+        reward = progress + gate_reward + crash_penalty + reward_alive
+        
+        components = {
             "reward_progress": progress[:, None],
             "reward_gate": gate_reward[:, None],
+            "reward_alive": reward_alive[:, None],
             "penalty_crash": crash_penalty[:, None],
         }
+        
+        return reward[:, None], components, dist_raw
 
-        return (reward + crash_penalty)[:, None]
 
 
 # region Wrappers
@@ -495,25 +543,27 @@ class RunningMeanStd:
         self.var = jp.ones(shape, "float32")
         self.count = epsilon
 
+    @staticmethod
+    @jax.jit
+    def update_from_moments(mean, var, count, batch_mean, batch_var, batch_count):
+        """Update from moments in a JITted way."""
+        delta = batch_mean - mean
+        tot_count = count + batch_count
+
+        new_mean = mean + delta * batch_count / tot_count
+        m_a = var * count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + jp.square(delta) * count * batch_count / tot_count
+        return new_mean, M2 / tot_count, tot_count
+
     def update(self, x: Array):
         """Update statistics."""
         batch_mean = jp.mean(x, axis=0)
         batch_var = jp.var(x, axis=0)
         batch_count = x.shape[0]
-        self.update_from_moments(batch_mean, batch_var, batch_count)
-
-    def update_from_moments(self, batch_mean, batch_var, batch_count):
-        """Update from moments."""
-        delta = batch_mean - self.mean
-        tot_count = self.count + batch_count
-
-        new_mean = self.mean + delta * batch_count / tot_count
-        m_a = self.var * self.count
-        m_b = batch_var * batch_count
-        M2 = m_a + m_b + jp.square(delta) * self.count * batch_count / tot_count
-        self.mean = new_mean
-        self.var = M2 / tot_count
-        self.count = tot_count
+        self.mean, self.var, self.count = self.update_from_moments(
+            self.mean, self.var, self.count, batch_mean, batch_var, batch_count
+        )
 
 
 class VecNormalize(VectorWrapper):
@@ -568,14 +618,14 @@ class VecNormalize(VectorWrapper):
         if self.ob_rms:
             if self.training:
                 self.ob_rms.update(obs)
-            obs = jp.clip(
-                (obs - self.ob_rms.mean) / jp.sqrt(self.ob_rms.var + self.epsilon),
-                -self.clipob,
-                self.clipob,
-            )
-            return obs
-        else:
-            return obs
+            return self._apply_filt(obs, self.ob_rms.mean, self.ob_rms.var, self.clipob, self.epsilon)
+        return obs
+
+    @staticmethod
+    @jax.jit
+    def _apply_filt(obs, mean, var, clip, epsilon):
+        """Apply filtering in a JITted way."""
+        return jp.clip((obs - mean) / jp.sqrt(var + epsilon), -clip, clip)
 
     def reset(self, **kwargs):
         """Override reset."""
@@ -657,6 +707,7 @@ def make_envs(
         control_mode=cfg.env.control_mode,
         disturbances=cfg.env.disturbances,
         device=jax_device,
+        alive_coef=coefs.get("alive_coef", 0.1),
     )
 
     env = NormalizeActions(env)
@@ -756,6 +807,7 @@ def train_ppo(
         "d_act_th_coef": args.d_act_th_coef,
         "act_coef": args.act_coef,
         "look_at_coef": args.look_at_coef,
+        "alive_coef": args.alive_coef,
         "global_scale": args.global_scale,
         "gamma": args.gamma,
     }
@@ -818,7 +870,7 @@ def train_ppo(
     sum_steps = torch.zeros((args.num_envs)).to(device)
     # Components accumulators
     component_keys = [
-        "reward_progress", "reward_gate", "penalty_crash",
+        "reward_progress", "reward_gate", "reward_alive", "penalty_crash",
         "penalty_action", "penalty_smoothness_thrust", "penalty_smoothness_xy",
         "penalty_look_at"
     ]
@@ -1149,8 +1201,8 @@ def main(
     wandb_enabled: bool = True,
     train: bool = True,
     eval: int = 1,
-    checkpoint_freq: float = 0.1,
-    resume: bool = True,
+    checkpoint_freq: float = 0.01,
+    resume: bool = False,
 ):
     """Main."""
     args = Args.create(checkpoint_freq=checkpoint_freq, resume=resume)
