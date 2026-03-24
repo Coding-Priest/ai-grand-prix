@@ -10,6 +10,7 @@ from typing import Literal
 
 import fire
 import gymnasium as gym
+import subprocess
 import jax
 import jax.numpy as jp
 import numpy as np
@@ -53,12 +54,15 @@ class MultiRaceTrainEnv(VecMultiDroneRaceEnv):
         self.num_envs = self.sim.n_drones
         
         obs_spec = {
-            "rpy":            spaces.Box(-np.pi, np.pi,  shape=(3,), dtype=np.float32),
-            "vel_body":       spaces.Box(-5.0,   5.0,    shape=(3,), dtype=np.float32),
-            "dist_target":    spaces.Box(-1.0, 1.0, shape=(1,), dtype=np.float32),
-            "dist_next":      spaces.Box(-1.0, 1.0, shape=(1,), dtype=np.float32),
-            "gate_vec_body":  spaces.Box(-1.0,  1.0,   shape=(3,), dtype=np.float32),
-            "gate_alignment": spaces.Box(-np.pi, np.pi,  shape=(1,), dtype=np.float32),
+            "rpy":                 spaces.Box(-np.pi, np.pi,  shape=(3,), dtype=np.float32),
+            "vel_body":            spaces.Box(-5.0,   5.0,    shape=(3,), dtype=np.float32),
+            "ang_vel":             spaces.Box(-5.0,   5.0,    shape=(3,), dtype=np.float32),
+            "dist_target":         spaces.Box(-1.0, 1.0, shape=(1,), dtype=np.float32),
+            "dist_next":           spaces.Box(-1.0, 1.0, shape=(1,), dtype=np.float32),
+            "gate_vec_body":       spaces.Box(-1.0,  1.0,   shape=(3,), dtype=np.float32),
+            "gate_alignment":      spaces.Box(-np.pi, np.pi,  shape=(1,), dtype=np.float32),
+            "gate_vec_body_next":  spaces.Box(-1.0,  1.0,   shape=(3,), dtype=np.float32),
+            "gate_alignment_next": spaces.Box(-np.pi, np.pi,  shape=(1,), dtype=np.float32),
         }
         self.single_observation_space = spaces.Dict(obs_spec)
         self.observation_space = batch_space(self.single_observation_space, self.num_envs)
@@ -77,6 +81,7 @@ class MultiRaceTrainEnv(VecMultiDroneRaceEnv):
         drone_pos  = base["pos"][0]    # (D, 3) 
         drone_quat = base["quat"][0]   # (D, 4) 
         vel_world  = base["vel"][0]    # (D, 3) 
+        ang_vel    = base["ang_vel"][0] # (D, 3)
 
         body_R = R.from_quat(drone_quat)
 
@@ -99,31 +104,43 @@ class MultiRaceTrainEnv(VecMultiDroneRaceEnv):
         target_gate_pos  = gates_pos[drone_ids, target_idx]
         next_gate_pos    = gates_pos[drone_ids, next_idx]
         target_gate_quat = gates_quat[drone_ids, target_idx]
+        next_gate_quat   = gates_quat[drone_ids, next_idx]
 
         # 3. Distance (raw, matching RaceTrainEnv)
         dist_target_raw = jp.linalg.norm(drone_pos - target_gate_pos, axis=-1, keepdims=True)
         dist_next_raw   = jp.linalg.norm(drone_pos - next_gate_pos,   axis=-1, keepdims=True)
 
         # 4. Unit vector to gate
-        gate_vec_world = target_gate_pos - drone_pos
-        gate_vec_body_raw = body_R.inv().apply(gate_vec_world)
-        gate_vec_body = gate_vec_body_raw / (jp.linalg.norm(gate_vec_body_raw, axis=-1, keepdims=True) + 1e-6)
+        def get_gate_vec_body(g_pos):
+            vec_world = g_pos - drone_pos
+            vec_body_raw = body_R.inv().apply(vec_world)
+            return vec_body_raw / (jp.linalg.norm(vec_body_raw, axis=-1, keepdims=True) + 1e-6)
+
+        gate_vec_body = get_gate_vec_body(target_gate_pos)
+        gate_vec_body_next = get_gate_vec_body(next_gate_pos)
 
         # 5. Gate alignment
-        local_x     = jp.broadcast_to(jp.array([1.0, 0.0, 0.0]), (self.sim.n_drones, 3))
-        gate_normal = R.from_quat(target_gate_quat).apply(local_x)
-        gate_yaw    = jp.arctan2(gate_normal[:, 1], gate_normal[:, 0])
-        align_diff  = gate_yaw - yaw
-        gate_alignment = jp.arctan2(jp.sin(align_diff), jp.cos(align_diff))[:, None]
+        def get_gate_alignment(g_quat):
+            local_x     = jp.broadcast_to(jp.array([1.0, 0.0, 0.0]), (self.sim.n_drones, 3))
+            gate_normal = R.from_quat(g_quat).apply(local_x)
+            gate_yaw    = jp.arctan2(gate_normal[:, 1], gate_normal[:, 0])
+            align_diff  = gate_yaw - yaw
+            return jp.arctan2(jp.sin(align_diff), jp.cos(align_diff))[:, None]
+
+        gate_alignment = get_gate_alignment(target_gate_quat)
+        gate_alignment_next = get_gate_alignment(next_gate_quat)
 
         # Returns (D, ...) directly
         return {
-            "rpy":            rpy,
-            "vel_body":       vel_body,
-            "dist_target":    dist_target_raw,
-            "dist_next":      dist_next_raw,
-            "gate_vec_body":  gate_vec_body,
-            "gate_alignment": gate_alignment,
+            "rpy":                 rpy,
+            "vel_body":            vel_body,
+            "ang_vel":             ang_vel,
+            "dist_target":         dist_target_raw,
+            "dist_next":           dist_next_raw,
+            "gate_vec_body":       gate_vec_body,
+            "gate_alignment":      gate_alignment,
+            "gate_vec_body_next":  gate_vec_body_next,
+            "gate_alignment_next": gate_alignment_next,
         }
 
 
@@ -160,6 +177,7 @@ def visualize(
     n_drones: int = 5,
     stochastic: bool = False,
     seed: int = 42,
+    record_path: str = None,
 ):
     """Run visualization."""
     # Load config etc
@@ -224,66 +242,103 @@ def visualize(
     ep_seed = seed
     fps = 60
     
+    process = None
+    if record_path:
+        print(f"Recording to {record_path} at {fps} FPS (using ffmpeg)...")
+    
     print(f"Starting simulation with {n_drones} drones at {cfg.env.freq} Hz...")
     
-    with torch.no_grad():
-        for episode in range(n_eval):
-            # Reset with incremental seed
-            next_obs, info = env.reset(seed=(ep_seed := ep_seed + 1))
-            # Zero-copy conversion for JAX to Torch (stays on GPU)
-            next_obs = torch.from_dlpack(next_obs).to(device)
-            
-            done = torch.zeros(n_drones, dtype=torch.bool, device=device)
-            episode_reward = 0
-            steps = 0
-            start_time = time.time()
-            
-            while not done.any():
-                # 1. Synchronize with real time for smooth playback
-                elapsed = time.time() - start_time
-                target_elapsed = steps / cfg.env.freq
-                if target_elapsed > elapsed:
-                    time.sleep(target_elapsed - elapsed)
-
-                # 2. Update camera (using unwrapped to access physics)
-                unwrapped = env.unwrapped
-                active_drones = ~unwrapped.data.disabled_drones[0] # (D,)
-                if active_drones.any():
-                    avg_pos = unwrapped.sim.data.states.pos[0, active_drones].mean(axis=0)
-                    unwrapped.cam_config["lookat"] = np.array(avg_pos)
-                    if active_drones.sum() > 1:
-                        spread = jp.linalg.norm(unwrapped.sim.data.states.pos[0, active_drones].max(axis=0) - unwrapped.sim.data.states.pos[0, active_drones].min(axis=0))
-                        unwrapped.cam_config["distance"] = max(2.5, spread * 1.5)
-                
-                # 3. Get actions from Agent
-                act, _, _, _ = agent.get_action_and_value(next_obs, deterministic=not stochastic)
-                    
-                # 4. Step environment
-                # Zero-copy conversion for Torch to JAX (stays on GPU)
-                action_jax = jax.dlpack.from_dlpack(act)
-                next_obs, reward, terminated, truncated, info = env.step(action_jax)
-                # Zero-copy conversion for JAX back to Torch (stays on GPU)
+    try:
+        with torch.no_grad():
+            for episode in range(n_eval):
+                # Reset with incremental seed
+                next_obs, info = env.reset(seed=(ep_seed := ep_seed + 1))
+                # Zero-copy conversion for JAX to Torch (stays on GPU)
                 next_obs = torch.from_dlpack(next_obs).to(device)
                 
-                # 5. Render
-                if ((steps * fps) % cfg.env.freq) < fps:
-                    unwrapped.render()
-                    
-                done = torch.from_numpy(np.array(terminated | truncated)).to(device)
-                episode_reward += reward[0].item() # Track first drone's reward
-                steps += 1
+                done = torch.zeros(n_drones, dtype=torch.bool, device=device)
+                cumulative_reward = jp.zeros(n_drones) # Track cumulative rewards for camera focus
+                reward = jp.zeros(n_drones) # Most recent reward
+                episode_total_reward = 0 # Track first drone's total reward for logging
+                steps = 0
+                start_time = time.time()
                 
-                if steps % 10 == 0:
-                    active_count = active_drones.sum()
-                    print(f"Episode {episode+1} | Step {steps}: {active_count}/{n_drones} drones active (FPS: {steps / (time.time() - start_time):.1f})", end="\r")
+                while not done.all():
+                    # 1. Synchronize with real time for smooth playback
+                    elapsed = time.time() - start_time
+                    target_elapsed = steps / cfg.env.freq
+                    if target_elapsed > elapsed:
+                        time.sleep(target_elapsed - elapsed)
+
+                    # 2. Update camera (using unwrapped to access physics)
+                    unwrapped = env.unwrapped
+                    active_drones = ~unwrapped.data.disabled_drones[0] # (D,)
+                    if active_drones.any():
+                        # Look at the drone with the highest cumulative reward
+                        active_cumulative = cumulative_reward[active_drones]
+                        max_reward_idx = active_cumulative.argmax()
+                        best_drone_pos = unwrapped.sim.data.states.pos[0, active_drones][max_reward_idx]
+                        unwrapped.cam_config["lookat"] = np.array(best_drone_pos)
+                        if active_drones.sum() > 1:
+                            spread = jp.linalg.norm(unwrapped.sim.data.states.pos[0, active_drones].max(axis=0) - unwrapped.sim.data.states.pos[0, active_drones].min(axis=0))
+                            unwrapped.cam_config["distance"] = 1
+                        
+                        # Manually update the renderer's camera to ensure tracking
+                        if unwrapped.sim.viewer is not None and unwrapped.sim.viewer.viewer is not None:
+                            unwrapped.sim.viewer.viewer.cam.lookat[:] = unwrapped.cam_config["lookat"]
+                            if "distance" in unwrapped.cam_config:
+                                unwrapped.sim.viewer.viewer.cam.distance = unwrapped.cam_config["distance"]
+
                     
-            episode_rewards.append(episode_reward)
-            episode_lengths.append(steps)
-            print(f"\nEpisode {episode + 1}: Reward = {episode_reward:.2f}, Length = {steps}")
+                    # 3. Get actions from Agent
+                    act, _, _, _ = agent.get_action_and_value(next_obs, deterministic=not stochastic)
+                        
+                    # 4. Step environment
+                    # Zero-copy conversion for Torch to JAX (stays on GPU)
+                    action_jax = jax.dlpack.from_dlpack(act)
+                    next_obs, reward, terminated, truncated, info = env.step(action_jax)
+                    # Zero-copy conversion for JAX back to Torch (stays on GPU)
+                    next_obs = torch.from_dlpack(next_obs).to(device)
+                    
+                    # 5. Render
+                    if ((steps * fps) % cfg.env.freq) < fps:
+                        if record_path:
+                            frame = unwrapped.sim.render(mode="rgb_array", cam_config=unwrapped.cam_config)
+                            if process is None:
+                                h, w, _ = frame.shape
+                                command = [
+                                    "ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
+                                    "-s", f"{w}x{h}", "-pix_fmt", "rgb24", "-r", str(fps),
+                                    "-i", "-", "-an", "-vcodec", "libx264", "-pix_fmt", "yuv420p",
+                                    record_path
+                                ]
+                                process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                            process.stdin.write(frame.tobytes())
+                        else:
+                            unwrapped.render()
+                        
+                    done = torch.from_numpy(np.array(terminated | truncated)).to(device)
+                    cumulative_reward += reward
+                    episode_total_reward += reward[0].item() # Track first drone's reward
+                    steps += 1
+                    
+                    if steps % 10 == 0:
+                        active_count = active_drones.sum()
+                        print(f"Episode {episode+1} | Step {steps}: {active_count}/{n_drones} drones active (FPS: {steps / (time.time() - start_time):.1f})", end="\r")
+                        
+                episode_rewards.append(episode_total_reward)
+                episode_lengths.append(steps)
+                print(f"\nEpisode {episode + 1}: Reward = {episode_total_reward:.2f}, Length = {steps}")
+
 
         print(
             f"\nAverage Reward = {np.mean(episode_rewards):.2f}, Length = {np.mean(episode_lengths)}"
         )
+    finally:
+        if process:
+            process.stdin.close()
+            process.wait()
+            print(f"Recording saved to {record_path}")
     
     env.close()
 

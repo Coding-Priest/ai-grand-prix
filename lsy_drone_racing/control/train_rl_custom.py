@@ -1,7 +1,9 @@
-"""A naive RL pipeline for drone racing."""
+import os
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 import random
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -28,6 +30,7 @@ from torch import Tensor
 from torch.distributions.normal import Normal
 
 from lsy_drone_racing.envs.drone_race import VecDroneRaceEnv
+# Pre-fetch utils
 from lsy_drone_racing.utils import load_config
 
 
@@ -52,21 +55,21 @@ class Args:
     # Algorithm specific arguments
     total_timesteps: int = 150_000_000
     """total timesteps of the experiments"""
-    learning_rate: float = 1.5e-4
+    learning_rate: float = 3e-4
     """the learning rate of the optimizer"""
     num_envs: int = 512
     """the number of parallel game environments"""
-    num_steps: int = 128
+    num_steps: int = 2048
     """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
     """Toggle learning rate annealing for policy and value networks"""
-    gamma: float = 0.94
+    gamma: float = 0.995
     """the discount factor gamma"""
     gae_lambda: float = 0.97
     """the lambda for the general advantage estimation"""
-    num_minibatches: int = 1
+    num_minibatches: int = 4
     """the number of mini-batches"""
-    update_epochs: int = 10
+    update_epochs: int = 4
     """the K epochs to update the policy"""
     norm_adv: bool = True
     """Toggles advantages normalization"""
@@ -118,15 +121,16 @@ class Args:
 class RaceTrainEnv(VecDroneRaceEnv):
     """Vectorized drone racing environment for RL training with compact ego-centric observations.
 
-    Compact observation (12 values total):
-        rpy (3)            – roll, pitch, yaw of the drone (radians)
-        vel_body (3)       – velocity in the drone's body frame
-        dist_target (1)    – exponential distance to target: 2*exp(-2*dist)-1 (mapped to [-1, 1])
-        dist_next (1)      – exponential distance to next gate: 2*exp(-2*dist)-1 (mapped to [-1, 1])
-        gate_vec_body (3)  – unit vector from drone to target gate in body frame (range [-1, 1])
-                             (encodes the 3D direction to the gate: fwd, left, up)
-        gate_alignment (1) – angle between gate's normal (fly-through axis) and drone yaw
-                             (0 = drone is perfectly aligned to fly through the gate)
+    Compact observation (19 values total):
+        rpy (3)                 – roll, pitch, yaw of the drone (radians)
+        vel_body (3)            – velocity in the drone's body frame
+        ang_vel (3)             – angular velocity in the world frame
+        dist_target (1)         – exponential distance to target: 2*exp(-2*dist)-1 (mapped to [-1, 1])
+        dist_next (1)           – exponential distance to next gate: 2*exp(-2*dist)-1 (mapped to [-1, 1])
+        gate_vec_body (3)       – unit vector from drone to target gate in body frame (range [-1, 1])
+        gate_alignment (1)      – angle between target gate's normal and drone yaw
+        gate_vec_body_next (3)  – unit vector from drone to next gate in body frame (range [-1, 1])
+        gate_alignment_next (1) – angle between next gate's normal and drone yaw
     """
 
     def __init__(self, **kwargs):
@@ -138,16 +142,19 @@ class RaceTrainEnv(VecDroneRaceEnv):
         self.prev_dist = jp.zeros((self.num_envs,))
         obs_spec = {
             # Euler angles: always in [-pi, pi]
-            "rpy":            spaces.Box(-np.pi, np.pi,  shape=(3,), dtype=np.float32),
-            # Body-frame velocity: CF2.1B hardware max ~2.5 m/s; allow 5 m/s for sim headroom
-            "vel_body":       spaces.Box(-5.0,   5.0,    shape=(3,), dtype=np.float32),
+            "rpy":                 spaces.Box(-np.pi, np.pi,  shape=(3,), dtype=np.float32),
+            # Velocities: CF2.1B hardware max ~2.5 m/s or rad/s; allow 5.0 for sim headroom
+            "vel_body":            spaces.Box(-5.0,   5.0,    shape=(3,), dtype=np.float32),
+            "ang_vel":             spaces.Box(-5.0,   5.0,    shape=(3,), dtype=np.float32),
             # Exponential distances: 2*exp(-2*dist)-1 maps [0, inf) to [-1, 1]
-            "dist_target":    spaces.Box(-1.0, 1.0, shape=(1,), dtype=np.float32),
-            "dist_next":      spaces.Box(-1.0, 1.0, shape=(1,), dtype=np.float32),
+            "dist_target":         spaces.Box(-1.0, 1.0, shape=(1,), dtype=np.float32),
+            "dist_next":           spaces.Box(-1.0, 1.0, shape=(1,), dtype=np.float32),
             # Body-frame unit vector to gate: [x,y,z] components in [-1, 1]
-            "gate_vec_body":  spaces.Box(-1.0,  1.0,   shape=(3,), dtype=np.float32),
-            # Gate alignment angle: wrapped to [-pi, pi]
-            "gate_alignment": spaces.Box(-np.pi, np.pi,  shape=(1,), dtype=np.float32),
+            "gate_vec_body":       spaces.Box(-1.0,  1.0,   shape=(3,), dtype=np.float32),
+            "gate_alignment":      spaces.Box(-np.pi, np.pi,  shape=(1,), dtype=np.float32),
+            # Next gate info
+            "gate_vec_body_next":  spaces.Box(-1.0,  1.0,   shape=(3,), dtype=np.float32),
+            "gate_alignment_next": spaces.Box(-np.pi, np.pi,  shape=(1,), dtype=np.float32),
         }
         self.single_observation_space = spaces.Dict(obs_spec)
         self.observation_space = batch_space(self.single_observation_space, self.num_envs)
@@ -164,6 +171,7 @@ class RaceTrainEnv(VecDroneRaceEnv):
         drone_pos  = base["pos"][:, 0, :]   # (N, 3)  world pos
         drone_quat = base["quat"][:, 0, :]  # (N, 4)  scipy (x,y,z,w)
         vel_world  = base["vel"][:, 0, :]   # (N, 3)  world-frame velocity
+        ang_vel_world = base["ang_vel"][:, 0, :] # (N, 3) world-frame angular velocity
 
         body_R = R.from_quat(drone_quat)    # batch rotation object
 
@@ -171,8 +179,9 @@ class RaceTrainEnv(VecDroneRaceEnv):
         rpy = body_R.as_euler("xyz")        # (N, 3) radians
         yaw = rpy[:, 2]                     # (N,)
 
-        # 2. Velocity in drone body frame
-        vel_body = body_R.inv().apply(vel_world)  # (N, 3)
+        # 2. Velocity and Angular Velocity
+        vel_body = body_R.inv().apply(vel_world)  # (N, 3) body frame
+        ang_vel = base["ang_vel"][:, 0, :]        # (N, 3) world frame
 
         # ── gate geometry ──────────────────────────────────────────────────────
         n_gates    = len(self.gates["pos"])
@@ -187,6 +196,7 @@ class RaceTrainEnv(VecDroneRaceEnv):
         target_gate_pos  = gates_pos[env_ids, target_idx]   # (N, 3)
         next_gate_pos    = gates_pos[env_ids, next_idx]     # (N, 3)
         target_gate_quat = gates_quat[env_ids, target_idx]  # (N, 4)
+        next_gate_quat   = gates_quat[env_ids, next_idx]    # (N, 4)
 
         # 3. Exponential distance to target gate and the one after it: 2*exp(-2.0 * dist) - 1
         #    This maps [0, inf) to [-1, 1]. Close = 1.0, Far = -1.0.
@@ -195,35 +205,38 @@ class RaceTrainEnv(VecDroneRaceEnv):
         dist_target = 2.0 * jp.exp(-2.0 * dist_target_raw) - 1.0
         dist_next   = 2.0 * jp.exp(-2.0 * dist_next_raw) - 1.0
 
-        # 4. Unit vector from drone to target gate expressed in the drone's body frame.
-        #    This encodes the 3D direction to the gate, normalized to range [-1, 1]:
-        #      gate_vec_body[:, 0]  → forward (+) / backward (-) component
-        #      gate_vec_body[:, 1]  → left (+) / right (-) component
-        #      gate_vec_body[:, 2]  → above (+) / below (-) component
-        gate_vec_world = target_gate_pos - drone_pos          # (N, 3)  world-frame offset
-        gate_vec_body_raw = body_R.inv().apply(gate_vec_world) # (N, 3)  body-frame offset
-        # Normalize to unit vector (direction)
-        gate_vec_body = gate_vec_body_raw / (jp.linalg.norm(gate_vec_body_raw, axis=-1, keepdims=True) + 1e-6)
+        # 4. Unit vector from drone to target and next gate expressed in the drone's body frame.
+        def get_gate_vec_body(target_pos):
+            vec_world = target_pos - drone_pos
+            vec_body_raw = body_R.inv().apply(vec_world)
+            return vec_body_raw / (jp.linalg.norm(vec_body_raw, axis=-1, keepdims=True) + 1e-6)
+
+        gate_vec_body = get_gate_vec_body(target_gate_pos)
+        gate_vec_body_next = get_gate_vec_body(next_gate_pos)
 
         # 5. Gate alignment: angle between gate's fly-through axis and drone yaw
         #    The gate's local +x axis is its normal (the axis you fly along to pass through).
-        #    Rotating [1,0,0] by the gate quaternion gives the world-space fly-through direction.
-        local_x     = jp.broadcast_to(jp.array([1.0, 0.0, 0.0]), (self.num_envs, 3))
-        gate_normal = R.from_quat(target_gate_quat).apply(local_x)  # (N, 3)
-        gate_yaw    = jp.arctan2(gate_normal[:, 1], gate_normal[:, 0])  # (N,) world bearing
-        align_diff  = gate_yaw - yaw  # (N,)
-        gate_alignment = jp.arctan2(
-            jp.sin(align_diff), jp.cos(align_diff)
-        )[:, None]  # (N, 1)
+        def get_gate_alignment(g_quat):
+            local_x     = jp.broadcast_to(jp.array([1.0, 0.0, 0.0]), (self.num_envs, 3))
+            gate_normal = R.from_quat(g_quat).apply(local_x)  # (N, 3)
+            gate_yaw    = jp.arctan2(gate_normal[:, 1], gate_normal[:, 0])  # (N,) world bearing
+            align_diff  = gate_yaw - yaw  # (N,)
+            return jp.arctan2(jp.sin(align_diff), jp.cos(align_diff))[:, None]  # (N, 1)
+
+        gate_alignment = get_gate_alignment(target_gate_quat)
+        gate_alignment_next = get_gate_alignment(next_gate_quat)
 
         # ── pack with drone dim so VecDroneRaceEnv.step() can squeeze with [:, 0] ──
         return {
-            "rpy":            rpy[:, None, :],             # (N, 1, 3)
-            "vel_body":       vel_body[:, None, :],        # (N, 1, 3)
-            "dist_target":    dist_target_raw[:, None, :],     # (N, 1, 1)
-            "dist_next":      dist_next_raw[:, None, :],       # (N, 1, 1)
-            "gate_vec_body":  gate_vec_body[:, None, :],   # (N, 1, 3)
-            "gate_alignment": gate_alignment[:, None, :],  # (N, 1, 1)
+            "rpy":                 rpy[:, None, :],             # (N, 1, 3)
+            "vel_body":            vel_body[:, None, :],        # (N, 1, 3)
+            "ang_vel":             ang_vel[:, None, :],         # (N, 1, 3)
+            "dist_target":         dist_target_raw[:, None, :],     # (N, 1, 1)
+            "dist_next":           dist_next_raw[:, None, :],       # (N, 1, 1)
+            "gate_vec_body":       gate_vec_body[:, None, :],   # (N, 1, 3)
+            "gate_alignment":      gate_alignment[:, None, :],  # (N, 1, 1)
+            "gate_vec_body_next":  gate_vec_body_next[:, None, :],   # (N, 1, 3)
+            "gate_alignment_next": gate_alignment_next[:, None, :],  # (N, 1, 1)
         }
 
     def _reset(self, mask: Array | None = None, **kwargs) -> tuple[dict, dict]:
@@ -627,7 +640,7 @@ def set_seeds(seed: int):
 
 # region MakeEnvs
 def make_envs(
-    config: str = "level0.toml",
+    config: str = "level3.toml",
     num_envs: int = None,
     jax_device: str = "cpu",
     torch_device: torch.device = torch.device("cpu"),
@@ -695,9 +708,9 @@ class Agent(nn.Module):
             layer_init(nn.Linear(256, torch.tensor(action_shape).prod()), std=0.01),
         )
         self.actor_logstd = nn.Parameter(
-            torch.Tensor([[-1, -1, -1, 1]])  # start with smaller std for roll, pitch, yaw
+            torch.Tensor([[0, 0, 0, 1]])  # start with smaller std for roll, pitch, yaw
         )
-        # self.actor_logstd = nn.Parameter(
+        # self.actor_logstd = nn.Parameter(128
         #     torch.zeros(1, torch.tensor(action_shape).prod()) 
         # )
 
@@ -803,7 +816,6 @@ def train_ppo(
     sum_rewards = torch.zeros((args.num_envs)).to(device)
     sum_rewards_raw = torch.zeros((args.num_envs)).to(device)
     sum_steps = torch.zeros((args.num_envs)).to(device)
-    
     # Components accumulators
     component_keys = [
         "reward_progress", "reward_gate", "penalty_crash",
@@ -811,9 +823,17 @@ def train_ppo(
         "penalty_look_at"
     ]
     sum_components = {k: torch.zeros((args.num_envs)).to(device) for k in component_keys}
+
+    # Create buffers to hold episodic stats for the entire rollout (no-sync tracking)
+    ep_rewards_buffer = torch.zeros((args.num_steps, args.num_envs), device=device)
+    ep_raw_rewards_buffer = torch.zeros((args.num_steps, args.num_envs), device=device)
+    ep_lengths_buffer = torch.zeros((args.num_steps, args.num_envs), device=device)
+    ep_components_buffer = {
+        k: torch.zeros((args.num_steps, args.num_envs), device=device) for k in component_keys
+    }
     
-    sum_rewards_hist = []
-    sum_rewards_raw_hist = []
+    sum_rewards_hist = deque(maxlen=1000)
+    sum_rewards_raw_hist = deque(maxlen=1000)
 
     for iteration in range(start_iteration, args.num_iterations + 1):
         start_time = time.time()
@@ -831,6 +851,8 @@ def train_ppo(
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
+                # Sanity check: prevent NaN observations from producing NaN actions
+                next_obs = torch.nan_to_num(next_obs, nan=0.0, posinf=10.0, neginf=-10.0)
                 action, logprob, _, value = agent.get_action_and_value(next_obs)
                 values[step] = value.flatten()
             actions[step] = action
@@ -838,60 +860,74 @@ def train_ppo(
 
             # TRY NOT TO MODIFY: execute the game and log data.
             next_obs, reward, terminations, truncations, infos = envs.step(action)
-            # envs.render()
+            
+            # Sanity check: prevent NaN from crashing training
+            reward = torch.nan_to_num(reward, nan=0.0, posinf=1.0, neginf=-1.0)
+            
             rewards[step] = reward
             sum_rewards += reward
             sum_steps += 1
             if "reward_raw" in infos:
-                sum_rewards_raw += torch.as_tensor(infos["reward_raw"]).to(device)
+                # Ensure zero-copy if coming from JaxToTorch dlpack, avoid .to(device) if already on GPU
+                r_raw = infos["reward_raw"]
+                if not isinstance(r_raw, torch.Tensor):
+                    r_raw = torch.as_tensor(r_raw, device=device)
+                sum_rewards_raw += r_raw
             
+            # --- THE NEW TRACKING LOGIC ---
+            # Store completed episode stats. next_done (from prev step) acts as multiplier.
+            ep_rewards_buffer[step] = sum_rewards * next_done
+            ep_raw_rewards_buffer[step] = sum_rewards_raw * next_done
+            ep_lengths_buffer[step] = sum_steps * next_done
             for k in component_keys:
                 if k in infos:
-                    sum_components[k] += torch.as_tensor(infos[k]).to(device).flatten()
+                    v = infos[k]
+                    if not isinstance(v, torch.Tensor):
+                        v = torch.as_tensor(v, device=device).flatten()
+                    sum_components[k] += v
+                ep_components_buffer[k][step] = sum_components[k] * next_done
 
-            sum_rewards_hist.extend(sum_rewards[next_done.bool()].tolist())
-            sum_rewards_raw_hist.extend(sum_rewards_raw[next_done.bool()].tolist())
+            # Reset tracking variables without boolean indexing (pure math)
+            mask_alive = 1.0 - next_done.float()
+            sum_rewards *= mask_alive
+            sum_rewards_raw *= mask_alive
+            sum_steps *= mask_alive
 
-            if wandb_enabled and next_done.any():
-                mask = next_done.bool()
-                lengths = torch.maximum(sum_steps[mask], torch.ones_like(sum_steps[mask]))
-                
-                log_dict = {
-                    "train/reward": (sum_rewards[mask]).mean().item(),
-                    "train/reward_raw": (sum_rewards_raw[mask]).mean().item(),
-                    "charts/avg_episode_length": lengths.mean().item(),
-                }
-                
-                # Track crash/success rates if components exist
-                if "penalty_crash" in sum_components:
-                    crashes = (sum_components["penalty_crash"][mask] <= -10.0).float()
+            for k in component_keys:
+                sum_components[k] *= mask_alive
+            
+            next_done = terminations | truncations
+
+        # --- BATCHED LOGGING (1 Sync per rollout) ---
+        done_mask = dones.bool()
+        completed_rewards = ep_rewards_buffer[done_mask].cpu().tolist()
+        completed_raw_rewards = ep_raw_rewards_buffer[done_mask].cpu().tolist()
+        completed_lengths = ep_lengths_buffer[done_mask].cpu().tolist()
+
+        sum_rewards_hist.extend(completed_rewards)
+        sum_rewards_raw_hist.extend(completed_raw_rewards)
+
+        if wandb_enabled and len(completed_rewards) > 0:
+            log_dict = {
+                "train/reward": np.mean(completed_rewards),
+                "train/reward_raw": np.mean(completed_raw_rewards),
+                "charts/avg_episode_length": np.mean(completed_lengths),
+            }
+            
+            # Track crash/success rates and components
+            for k in component_keys:
+                comp_vals = ep_components_buffer[k][done_mask].cpu()
+                if k == "penalty_crash":
+                    crashes = (comp_vals <= -10.0).float()
                     log_dict["charts/crash_rate"] = crashes.mean().item()
-                
-                if "reward_gate" in sum_components:
-                    successes = (sum_components["reward_gate"][mask] > 0).float()
+                elif k == "reward_gate":
+                    successes = (comp_vals > 0).float()
                     log_dict["charts/success_rate"] = successes.mean().item()
                 
-                per_step_components = [
-                    "reward_progress", "penalty_action", 
-                    "penalty_smoothness_thrust", "penalty_smoothness_xy", 
-                    "penalty_look_at"
-                ]
-                
-                for k in component_keys:
-                    if k in sum_components:
-                        if k in per_step_components:
-                            log_dict[f"train/{k}"] = (sum_components[k][mask]).mean().item()
-                        else:
-                            log_dict[f"train/{k}"] = sum_components[k][mask].mean().item()
-                
-                wandb.log(log_dict, step=global_step)
+                # per-step components (averaged over finished episodes)
+                log_dict[f"train/{k}"] = comp_vals.mean().item()
             
-            sum_rewards[next_done.bool()] = 0
-            sum_rewards_raw[next_done.bool()] = 0
-            sum_steps[next_done.bool()] = 0
-            for k in component_keys:
-                sum_components[k][next_done.bool()] = 0
-            next_done = terminations | truncations
+            wandb.log(log_dict, step=global_step)
 
         # bootstrap value if not done
         with torch.no_grad():
@@ -972,6 +1008,10 @@ def train_ppo(
                 optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                # Extra safety: ensure no NaN/Inf gradients survive
+                for param in agent.parameters():
+                    if param.grad is not None:
+                        torch.nan_to_num(param.grad, nan=0.0, posinf=1.0, neginf=-1.0, out=param.grad)
                 optimizer.step()
 
             if args.target_kl is not None and approx_kl > args.target_kl:
@@ -1001,10 +1041,10 @@ def train_ppo(
         # Iterative checkpointing every checkpoint_freq * total_iterations
         if iteration % max(1, int(args.num_iterations * args.checkpoint_freq)) == 0:
             avg_reward = (
-                np.mean(sum_rewards_hist[-100:]) if sum_rewards_hist else -float("inf")
+                np.mean(list(sum_rewards_hist)[-100:]) if sum_rewards_hist else -float("inf")
             )
             avg_raw_reward = (
-                np.mean(sum_rewards_raw_hist[-100:]) if sum_rewards_raw_hist else -float("inf")
+                np.mean(list(sum_rewards_raw_hist)[-100:]) if sum_rewards_raw_hist else -float("inf")
             )
             latest_path = checkpoint_dir / "latest.ckpt"
             state = {
@@ -1107,10 +1147,10 @@ def evaluate_ppo(args: Args, n_eval: int) -> tuple[float, float]:
 # region Main
 def main(
     wandb_enabled: bool = True,
-    train: bool = False,
+    train: bool = True,
     eval: int = 1,
     checkpoint_freq: float = 0.1,
-    resume: bool = False,
+    resume: bool = True,
 ):
     """Main."""
     args = Args.create(checkpoint_freq=checkpoint_freq, resume=resume)
