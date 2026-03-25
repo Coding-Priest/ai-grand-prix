@@ -33,3 +33,7 @@ dependencies = [
   "jax[cuda12]",
   "torch==2.8.0"
 ]
+
+[tool.setuptools.packages]
+find = {}
+
