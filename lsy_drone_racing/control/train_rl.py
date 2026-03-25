@@ -14,7 +14,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import wandb
 from crazyflow.envs.drone_env import DroneEnv
 from crazyflow.envs.norm_actions_wrapper import NormalizeActions
 from crazyflow.sim.data import SimData
@@ -561,8 +560,6 @@ def train_ppo(
     An implementation of PPO from cleanrl, see https://docs.cleanrl.dev/.
     """
     # train setup
-    if wandb_enabled and wandb.run is None:
-        wandb.init(project=args.wandb_project_name, entity=args.wandb_entity, config=vars(args))
     train_start_time = time.time()
     set_seeds(args.seed)  # TRY NOT TO MODIFY: seeding
     print("Training on device:", device, "| Environment device:", jax_device)
@@ -634,12 +631,6 @@ def train_ppo(
             sum_rewards += reward
             sum_rewards[next_done.bool()] = 0
             next_done = terminations | truncations
-
-            if wandb_enabled and next_done.any():
-                for r in sum_rewards[next_done.bool()]:
-                    wandb.log({"train/reward": r.item()}, step=global_step)
-                    sum_rewards_hist.append(r.item())
-
         # bootstrap value if not done
         with torch.no_grad():
             next_value = agent.get_value(next_obs).reshape(1, -1)
@@ -729,21 +720,6 @@ def train_ppo(
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
-        if wandb_enabled:
-            wandb.log(
-                {
-                    "charts/learning_rate": optimizer.param_groups[0]["lr"],
-                    "losses/value_loss": v_loss.item(),
-                    "losses/policy_loss": pg_loss.item(),
-                    "losses/entropy": entropy_loss.item(),
-                    "losses/old_approx_kl": old_approx_kl.item(),
-                    "losses/approx_kl": approx_kl.item(),
-                    "losses/clipfrac": np.mean(clipfracs),
-                    "losses/explained_variance": explained_var,
-                    "charts/SPS": int(global_step / (time.time() - start_time)),
-                },
-                step=global_step,
-            )
         end_time = time.time()
         print(f"Iter {iteration}/{args.num_iterations} took {end_time - start_time:.2f} seconds")
     train_end_time = time.time()
@@ -815,15 +791,6 @@ def main(wandb_enabled: bool = True, train: bool = True, eval: int = 1):
 
     if eval > 0:  # use "--eval <N>" to perform N evaluation episodes
         episode_rewards, episode_lengths = evaluate_ppo(args, eval, model_path)
-        if wandb_enabled and train:
-            wandb.log(
-                {
-                    "eval/mean_rewards": np.mean(episode_rewards),
-                    "eval/mean_steps": np.mean(episode_lengths),
-                }
-            )
-            wandb.finish()
-
-
+        
 if __name__ == "__main__":
     fire.Fire(main)
