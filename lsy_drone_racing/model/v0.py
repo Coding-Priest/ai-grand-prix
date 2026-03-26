@@ -102,7 +102,6 @@ class Agent:
         return params, opts, loss
 
     def backward(self):
-        if not self.train:
         lj = len(self.jxobs)
         lr = len(self.rewards)
         la = len(self.jxacts)
