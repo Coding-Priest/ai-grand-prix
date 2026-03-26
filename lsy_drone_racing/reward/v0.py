@@ -11,10 +11,11 @@
 # ur  = cos(yv)       `up right cosine` 
 # yaw = atan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz))
 
+import numpy as np
 from numpy.typing import NDArray
 
 def reward(
-        obs: dict[str, NDArray(np.floating)],
-        act: NDArray(np.floating)) -> float:
+        obs: dict[str, NDArray[np.floating]],
+        act: NDArray[np.floating]) -> float:
     return 0.0
 

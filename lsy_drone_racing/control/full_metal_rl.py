@@ -1,11 +1,33 @@
+import os
+import sys
+
+from pathlib import Path
+
 import numpy as np
 from numpy.typing import NDArray
 
 from lsy_drone_racing.control import Controller
+import lsy_drone_racing.reward as reward
+import lsy_drone_racing.model as model
 
 class FullMetalRL(Controller):
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
         super().__init__(obs, info, config)
+
+        self.train  = config.rl.train
+        self.reward = getattr(reward, config.rl.reward, None)
+        self.policy = getattr(getattr(model, config.rl.model, None), "Policy", None)
+
+        assert not self.train or (self.reward is not None), f"invalid reward '{config.rl.reward}'"
+        assert self.policy is not None, f"invalid model '{config.rl.model}'"
+
+        _ckpt = config.rl.checkpoint
+        if _ckpt:
+            _ckpt = Path(__file__).parent.parent / _ckpt 
+        else:
+            """
+            train from scratch
+            """
         
     def compute_control(
             self, 
@@ -41,7 +63,6 @@ class FullMetalRL(Controller):
             terminated: bool,
             truncated: bool,
             info: dict) -> bool:
-        print(terminated, truncated)
         return False
 
     def episode_callback(self):
