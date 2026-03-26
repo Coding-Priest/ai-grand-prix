@@ -23,8 +23,9 @@ drone_model = "cf21B_500"                        # Model of the drone, i.e., cf2
 [rl]
 train = true
 model = "v0"
-reward = "v1"
+reward = "v0"
 checkpoint = ""
+save = "trial.msgpack"
 
 [sim]
 # Physics options:

@@ -11,8 +11,10 @@
 # ur  = cos(yv)       `up right cosine` 
 # yaw = atan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz))
 
+import math
 import numpy as np
 from numpy.typing import NDArray
+import lsy_drone_racing.utils as utils
 
 def reward(
         obs: dict[str, NDArray[np.floating]],
