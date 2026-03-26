@@ -126,7 +126,7 @@ class Agent:
         self.rewards.clear()
         self.jxacts.clear()
 
-        return float(loss), G[0][0]
+        return float(loss), sum(g[0] for g in G)
 
     def save(self, path: Path | str):
         path = Path(path)
