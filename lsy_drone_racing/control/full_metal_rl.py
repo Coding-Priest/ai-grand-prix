@@ -23,7 +23,7 @@ class FullMetalRL(Controller):
         assert self.model is not None, f"invalid model '{config.rl.model}'"
  
         _ckpt = Path(__file__).parent.parent / ".ckpt" / config.rl.checkpoint
-        self.agent = self.model.Agent(self.train, 19, alpha=0.1, gamma=0.99, ckpt=_ckpt)
+        self.agent = self.model.Agent(self.train, 19, alpha=0.001, gamma=0.8, ckpt=_ckpt)
         
         self.save = Path(__file__).parent.parent / ".ckpt" / config.rl.save
 
@@ -89,11 +89,14 @@ class FullMetalRL(Controller):
             terminated: bool,
             truncated: bool,
             info: dict) -> bool:
-        self.agent.consume(-1.0 - 100 * terminated)
+        r = self.reward(obs, act, terminated)
+        self.agent.consume(r)
         return False
 
     def episode_callback(self):
+        if not self.train:
+            return 
         loss, ret = self.agent.backward()
-        print(f"episode loss: {loss:.6f} \tepisode return: {ret:.2f}")
+        print(f"episode loss: {loss:.6f} \tepisode return: {ret:.6f}")
         if not self.save.is_dir():
             self.agent.save(self.save)

@@ -13,9 +13,9 @@ def rpy2quat(roll, pitch, yaw):
     y = cr * sp * cy + sr * cp * sy
     z = cr * cp * sy - sr * sp * cy
 
-    return [w, x, y, z]
+    return [x, y, z, w]
 
-def quat2rpy(w, x, y, z):
+def quat2rpy(x, y, z, w):
     sinr_cosp = 2 * (w * x + y * z)
     cosr_cosp = 1 - 2 * (x**2 + y**2)
     roll = math.atan2(sinr_cosp, cosr_cosp)

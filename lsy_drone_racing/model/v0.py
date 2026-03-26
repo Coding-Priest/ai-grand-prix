@@ -16,7 +16,7 @@ SQRT_2PI = 2.5066282746310002
 EPSILON  = 1e-6
 
 class Policy(nn.Module):
-    nslope: float = 0.1
+    nslope: float = 0.01
 
     @nn.compact
     def __call__(self, v):
@@ -102,6 +102,7 @@ class Agent:
         return params, opts, loss
 
     def backward(self):
+        if not self.train:
         lj = len(self.jxobs)
         lr = len(self.rewards)
         la = len(self.jxacts)

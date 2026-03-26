@@ -18,6 +18,10 @@ import lsy_drone_racing.utils as utils
 
 def reward(
         obs: dict[str, NDArray[np.floating]],
-        act: NDArray[np.floating]) -> float:
-    return 0.0
+        act: NDArray[np.floating],
+        terminated: bool) -> float:
 
+    qx, qy, qz, qw = obs["quat"]
+    yv = math.atan2(qw, qz)
+    
+    return - abs(math.cos(yv)) - 2 * terminated

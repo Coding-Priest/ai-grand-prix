@@ -1,1 +1,1 @@
-from .v0 import reward as v0
+from .upright import reward as upright
