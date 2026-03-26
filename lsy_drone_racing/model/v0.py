@@ -86,7 +86,7 @@ class Agent:
         else:
             act = mu
 
-        return np.asarray(act)
+        return np.asarray(act).squeeze(), np.asarray(1 / (std + EPSILON)).squeeze()
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def step(self, params, opts, jxobs, jxacts, jxG):

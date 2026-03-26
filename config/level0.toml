@@ -24,7 +24,7 @@ drone_model = "cf21B_500"                        # Model of the drone, i.e., cf2
 train = true
 model = "v0"
 reward = "upright"
-checkpoint = "upright.msgpack"
+checkpoint = ""
 save = "upright.msgpack"
 
 [sim]
