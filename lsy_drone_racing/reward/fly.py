@@ -23,6 +23,9 @@ def reward(
 
     qx, qy, qz, qw = obs["quat"]
     yv = math.atan2(qw, qz)
-    dz = obs["pos"][2] - obs["gates_pos"][0][2]
+    ur = abs(math.cos(yv))
     
-    return -math.tanh(abs(math.cos(yv)) + 10 * terminated)
+    i  = obs["target_gate"]
+    dz = obs["gates_pos"][i][2] - obs["pos"][2] 
+   
+    return 10 - 10 * ur - 10 * dz * dz - 1000 * terminated

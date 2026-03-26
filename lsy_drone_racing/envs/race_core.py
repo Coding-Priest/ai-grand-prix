@@ -552,7 +552,7 @@ class RaceCoreEnv:
     ) -> EnvData:
         """Step the environment data."""
         n_gates = len(data.gate_mj_ids)
-        taken_off_drones = (data.steps > freq // 50)[:, None]  # Only activate check after 0.2s
+        taken_off_drones = (data.steps > freq // 5)[:, None]  # Only activate check after 0.2s
         disabled_drones = taken_off_drones & RaceCoreEnv._disabled_drones(drone_pos, contacts, data)
         gates_pos = mocap_pos[:, data.gate_mj_ids]
         obstacles_pos = mocap_pos[:, data.obstacle_mj_ids]
