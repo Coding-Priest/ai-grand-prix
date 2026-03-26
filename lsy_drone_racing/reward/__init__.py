@@ -1,1 +1,1 @@
-from .upright import reward as upright
+from .hover import reward as hover
