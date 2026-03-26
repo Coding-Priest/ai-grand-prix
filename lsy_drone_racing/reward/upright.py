@@ -24,4 +24,4 @@ def reward(
     qx, qy, qz, qw = obs["quat"]
     yv = math.atan2(qw, qz)
     
-    return - abs(math.cos(yv)) - 10 * terminated
+    return - math.tanh(abs(math.cos(yv)) + 10 * terminated)

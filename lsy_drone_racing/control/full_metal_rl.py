@@ -23,7 +23,7 @@ class FullMetalRL(Controller):
         assert self.model is not None, f"invalid model '{config.rl.model}'"
  
         _ckpt = Path(__file__).parent.parent / ".ckpt" / config.rl.checkpoint
-        self.agent = self.model.Agent(self.train, 19, alpha=0.001, gamma=0.8, ckpt=_ckpt)
+        self.agent = self.model.Agent(self.train, 19, alpha=0.001, gamma=0.5, ckpt=_ckpt)
         
         self.save = Path(__file__).parent.parent / ".ckpt" / config.rl.save
 
