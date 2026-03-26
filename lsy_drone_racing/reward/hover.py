@@ -21,8 +21,18 @@ def reward(
         act: NDArray[np.floating],
         terminated: bool) -> float:
 
+    if terminated:
+        return -50.0 
+
+    sbo = 1.0 
+
+    tz = obs["gates_pos"][0][2]
+    cz = obs["pos"][2]
+    dz_sq = (cz - tz) ** 2 
+
     qx, qy, qz, qw = obs["quat"]
-    yv = math.atan2(qw, qz)
-    dz = obs["pos"][2] - obs["gates_pos"][0][2]
-    
-    return -math.tanh(10 * abs(math.cos(yv)) + 4 * dz * dz + 10 * terminated)
+    tp = (qx**2 + qy**2) 
+
+    step_reward = sbo - (10.0 * dz_sq) - (10.0 * tp)
+
+    return step_reward

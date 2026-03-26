@@ -21,20 +21,15 @@ class Policy(nn.Module):
     @nn.compact
     def __call__(self, v):
 
-        h = nn.leaky_relu(nn.Dense(features=64)(v), negative_slope=self.nslope)
-        h = nn.leaky_relu(nn.Dense(features=128)(h), negative_slope=self.nslope)
-        h = nn.leaky_relu(nn.Dense(features=128)(h), negative_slope=self.nslope)
-        h = nn.leaky_relu(nn.Dense(features=128)(h), negative_slope=self.nslope)
-        h = nn.leaky_relu(nn.Dense(features=128)(h), negative_slope=self.nslope)
-        h = nn.leaky_relu(nn.Dense(features=64)(h), negative_slope=self.nslope)
+        h = nn.leaky_relu(nn.Dense(features=256)(v), negative_slope=self.nslope)
+        h = nn.leaky_relu(nn.Dense(features=256)(h), negative_slope=self.nslope)
+        h = nn.leaky_relu(nn.Dense(features=256)(h), negative_slope=self.nslope)
         
-        m = nn.leaky_relu(nn.Dense(features=64)(h), negative_slope=self.nslope)
-        m = nn.leaky_relu(nn.Dense(features=4)(m), negative_slope=self.nslope)
-        mu = nn.tanh(m)
+        m   = nn.leaky_relu(nn.Dense(features=256)(h), negative_slope=self.nslope)
+        mu  = nn.tanh(nn.Dense(features=4)(m))
 
-        s = nn.leaky_relu(nn.Dense(features=64)(h), negative_slope=self.nslope)
-        s = nn.leaky_relu(nn.Dense(features=4)(s), negative_slope=self.nslope)
-        std = nn.softplus(s) + EPSILON
+        s   = nn.leaky_relu(nn.Dense(features=256)(h), negative_slope=self.nslope)
+        std = nn.softplus(nn.Dense(features=4)(s)) + EPSILON
 
         return mu, std
 
@@ -53,7 +48,7 @@ class Agent:
 
         self.policy = Policy()
 
-        self.key = jax.random.PRNGKey(1) 
+        self.key = jax.random.PRNGKey(42) 
         self.key, init_key = jax.random.split(self.key)
         self.params = self.policy.init(init_key, jnp.zeros((1, obs_dim))) 
 
@@ -68,7 +63,7 @@ class Agent:
             self.jxobs   = []
             self.rewards = []
             self.jxacts  = []
-        
+
     def consume(self, reward):
         if self.train:
             self.rewards.append(reward)
@@ -93,7 +88,7 @@ class Agent:
         def lfn(params):
             mus, stds = self.policy.apply(params, jxobs)
             nll  = (0.5 * ((mus - jxacts) / stds) ** 2 + jnp.log(stds * SQRT_2PI)).sum(axis=1)
-            loss = - (jxG * nll).mean()
+            loss = (jxG * nll).mean()
             return loss
 
         loss, dw = jax.value_and_grad(lfn)(params)
@@ -115,10 +110,10 @@ class Agent:
             G.append([g])
         G = list(reversed(G))
         
-        jxobs     = jnp.stack(self.jxobs).astype(jnp.float32)
-        jxacts    = jnp.stack(self.jxacts).astype(jnp.float32)
-        jxG       = jnp.array(G, dtype=jnp.float32)
-        # jxG       = (jxG - jxG.mean()) / (jxG.std() + EPSILON)
+        jxobs  = jnp.stack(self.jxobs).astype(jnp.float32)
+        jxacts = jnp.stack(self.jxacts).astype(jnp.float32)
+        jxG    = jnp.array(G, dtype=jnp.float32)
+        jxG    = (jxG - jxG.mean()) / (jxG.std() + EPSILON)
 
         self.params, self.opts, loss = self.step(self.params, self.opts, jxobs, jxacts, jxG)
     
@@ -133,4 +128,3 @@ class Agent:
         path.parent.mkdir(parents=True, exist_ok=True)
         bo = serialization.to_bytes(self.params)
         open(path, "wb").write(bo)
-        

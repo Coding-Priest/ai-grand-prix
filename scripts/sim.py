@@ -73,10 +73,11 @@ def simulate(
     )
     env = JaxToNumpy(env)
 
+    obs, info = env.reset()
+    controller: Controller = controller_cls(obs, info, config)
     ep_times = []
     for _ in range(n_runs):  # Run n_runs episodes with the controller
         obs, info = env.reset()
-        controller: Controller = controller_cls(obs, info, config)
         i = 0
         fps = 60
 
@@ -104,7 +105,6 @@ def simulate(
             i += 1
 
         controller.episode_callback()  # Update the controller internal state and models.
-        log_episode_stats(obs, info, config, curr_time)
         controller.episode_reset()
         ep_times.append(curr_time if obs["target_gate"] == -1 else None)
 

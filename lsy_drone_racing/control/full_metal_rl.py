@@ -17,13 +17,13 @@ class FullMetalRL(Controller):
 
         self.train  = config.rl.train
         self.reward = getattr(reward, config.rl.reward, None)
-        self.model = getattr(model, config.rl.model, None)
+        self.model  = getattr(model, config.rl.model, None)
 
         assert not self.train or (self.reward is not None), f"invalid reward '{config.rl.reward}'"
         assert self.model is not None, f"invalid model '{config.rl.model}'"
  
         _ckpt = Path(__file__).parent.parent / ".ckpt" / config.rl.checkpoint
-        self.agent = self.model.Agent(self.train, 19, alpha=0.001, gamma=0.8, ckpt=_ckpt)
+        self.agent = self.model.Agent(self.train, 19, alpha=0.01, gamma=0.8, ckpt=_ckpt)
         self.save = Path(__file__).parent.parent / ".ckpt" / config.rl.save
         self.ep = 0
 
@@ -76,7 +76,7 @@ class FullMetalRL(Controller):
             vx, vy, vz, wx, wy, wz,
             gx, gy, gz, gya,
             ox, oy, oz
-        ]]) # shape = (1, 19)
+        ]], dtype=np.float32) # shape = (1, 19)
 
         act, confidence = self.agent.forward(statev)
         return act
@@ -97,7 +97,7 @@ class FullMetalRL(Controller):
         if not self.train:
             return 
         loss, ret = self.agent.backward()
-        print(f"episode{self.ep} loss: {loss:.6f} \tepisode return: {ret:.6f}")
+        print(f"episode{self.ep} loss: {loss:.6f} \treturn: {ret:.6f}")
         self.ep += 1
         if not self.save.is_dir():
             self.agent.save(self.save)
