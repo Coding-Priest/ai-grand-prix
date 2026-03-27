@@ -25,10 +25,8 @@ def reward(
 
     global I
 
-    if terminated:
-        return -50.0 
 
-    sbo = 0.0 
+    sbo = 5.0 
 
     i = obs["target_gate"]
     dx = (obs["pos"][0] - obs["gates_pos"][i][0]) 
@@ -42,8 +40,11 @@ def reward(
 
     if I != i:
         I = i
-        return 50
+        return 50.0
 
-    step_reward = sbo - (2.0 * dr2)
+    if terminated:
+        return -100.0 
+
+    step_reward = sbo - 1.0 * dr2 - 100.0 * tp
 
     return step_reward

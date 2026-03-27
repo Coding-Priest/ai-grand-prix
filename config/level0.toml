@@ -26,7 +26,7 @@ model = "v0"
 reward = "gate"
 checkpoint = ""
 save = "gate.msgpack"
-il_prob = 0.4
+il_prob = 0.5
 
 [sim]
 # Physics options:

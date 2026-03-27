@@ -57,7 +57,7 @@ class Agent:
             self.params = serialization.from_bytes(self.params, open(ckpt, "rb").read())
 
         if train:
-            self.optim = optax.adam(learning_rate=self.alpha)
+            self.optim = optax.sgd(learning_rate=self.alpha)
             self.opts = self.optim.init(self.params)
 
             self.jxobs   = []
@@ -95,11 +95,15 @@ class Agent:
         return np.asarray(act).squeeze(), np.asarray(1 / (std + EPSILON)).squeeze()
 
     @functools.partial(jax.jit, static_argnums=(0,))
-    def step(self, params, opts, jxobs, jxacts, jxG):
+    def step(self, params, opts, jxobs, jxacts, jxG, is_il):
         def lfn(params):
             mus, stds = self.policy.apply(params, jxobs)
             nll  = (0.5 * ((mus - jxacts) / stds) ** 2 + jnp.log(stds * SQRT_2PI)).sum(axis=1)
-            loss = (jxG * nll).mean()
+            loss = jax.lax.cond(
+                is_il,
+                lambda: nll.mean(), 
+                lambda: (jxG * nll).mean()
+            )
             return loss
 
         loss, dw = jax.value_and_grad(lfn)(params)
@@ -107,7 +111,7 @@ class Agent:
         params = optax.apply_updates(params, updates)
         return params, opts, loss
 
-    def backward(self):
+    def backward(self, is_il):
         lj = len(self.jxobs)
         lr = len(self.rewards)
         la = len(self.jxacts)
@@ -124,9 +128,12 @@ class Agent:
         jxobs  = jnp.stack(self.jxobs).astype(jnp.float32)
         jxacts = jnp.stack(self.jxacts).astype(jnp.float32)
         jxG    = jnp.array(G, dtype=jnp.float32)
-        jxG    = (jxG - jxG.mean()) / (jxG.std() + EPSILON)
+        if is_il:
+            jxG = jnp.zeros_like(jxG)
+        else:
+            jxG = (jxG - jxG.mean()) / (jxG.std() + EPSILON)
 
-        self.params, self.opts, loss = self.step(self.params, self.opts, jxobs, jxacts, jxG)
+        self.params, self.opts, loss = self.step(self.params, self.opts, jxobs, jxacts, jxG, is_il)
     
         self.jxobs.clear()
         self.rewards.clear()

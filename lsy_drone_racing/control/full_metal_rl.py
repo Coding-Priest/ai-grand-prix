@@ -29,7 +29,7 @@ class FullMetalRL(Controller):
         assert self.model is not None, f"invalid model '{config.rl.model}'"
  
         _ckpt = Path(__file__).parent.parent / ".ckpt" / config.rl.checkpoint
-        self.agent = self.model.Agent(self.train, 19, alpha=0.01, gamma=0.9, ckpt=_ckpt)
+        self.agent = self.model.Agent(self.train, 19, alpha=0.01, gamma=0.99, ckpt=_ckpt)
         self.save = Path(__file__).parent.parent / ".ckpt" / config.rl.save
         self.ep = 0
 
@@ -171,6 +171,7 @@ class FullMetalRL(Controller):
             act, _ = self.agent.forward(statev, iact)
         else:
             act, confidence = self.agent.forward(statev)
+        print(act)
         return act
 
     def step_callback(
@@ -188,18 +189,13 @@ class FullMetalRL(Controller):
         return False
 
     def episode_callback(self):
-
         self.i_error[:] = 0
         self._tick = 0
-
-        self.il = random.random() < self.il_prob
-        if self.il:
-            print("immitation learning")
-
         if not self.train:
             return 
-        loss, ret = self.agent.backward()
-        print(f"episode{self.ep} loss: {loss:.6f} \treturn: {ret:.6f}")
+        loss, ret = self.agent.backward(self.il)
+        print(f"episode{self.ep} loss: {loss:.6f} \t\treturn: {ret:.6f}" + (" (immitation learning)" if self.il else ""))
+        self.il = random.random() < self.il_prob
         self.ep += 1
         if not self.save.is_dir():
             self.agent.save(self.save)
