@@ -16,15 +16,19 @@ import numpy as np
 from numpy.typing import NDArray
 import lsy_drone_racing.utils as utils
 
+I = 0
+
 def reward(
         obs: dict[str, NDArray[np.floating]],
         act: NDArray[np.floating],
         terminated: bool) -> float:
 
+    global I
+
     if terminated:
         return -50.0 
 
-    sbo = 4.0 
+    sbo = 0.0 
 
     i = obs["target_gate"]
     dx = (obs["pos"][0] - obs["gates_pos"][i][0]) 
@@ -35,6 +39,10 @@ def reward(
 
     qx, qy, qz, qw = obs["quat"]
     tp = qx**2 + qy**2 
+
+    if I != i:
+        I = i
+        return 50
 
     step_reward = sbo - (2.0 * dr2)
 
