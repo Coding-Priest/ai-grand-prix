@@ -68,8 +68,19 @@ class Agent:
         if self.train:
             self.rewards.append(reward)
 
-    def forward(self, ob: NDArray[np.floating]) -> np.ndarray:
-        jxob   = jax.device_put(ob)
+    def forward(
+            self, ob: NDArray[np.floating],
+            iact: NDArray[np.floating] | None = None) -> np.ndarray:
+
+        jxob = jax.device_put(ob)
+
+        if iact is not None:
+            jxact = jnp.array(iact.reshape(1, -1))
+            if self.train:
+                self.jxobs.append(jxob)
+                self.jxacts.append(jxact)
+            return iact, None
+
         mu, std = self.policy.apply(self.params, jxob)
 
         if self.train:
