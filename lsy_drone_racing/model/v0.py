@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import random
 import functools
 import numpy as np
 from numpy.typing import NDArray
@@ -48,7 +49,7 @@ class Agent:
 
         self.policy = Policy()
 
-        self.key = jax.random.PRNGKey(42) 
+        self.key = jax.random.PRNGKey(random.randint(0, 1000)) 
         self.key, init_key = jax.random.split(self.key)
         self.params = self.policy.init(init_key, jnp.zeros((1, obs_dim))) 
 
@@ -57,7 +58,7 @@ class Agent:
             self.params = serialization.from_bytes(self.params, open(ckpt, "rb").read())
 
         if train:
-            self.optim = optax.sgd(learning_rate=self.alpha)
+            self.optim = optax.adam(learning_rate=self.alpha)
             self.opts = self.optim.init(self.params)
 
             self.jxobs   = []
@@ -130,8 +131,6 @@ class Agent:
         jxG    = jnp.array(G, dtype=jnp.float32)
         if is_il:
             jxG = jnp.zeros_like(jxG)
-        else:
-            jxG = (jxG - jxG.mean()) / (jxG.std() + EPSILON)
 
         self.params, self.opts, loss = self.step(self.params, self.opts, jxobs, jxacts, jxG, is_il)
     

@@ -24,9 +24,9 @@ drone_model = "cf21B_500"                        # Model of the drone, i.e., cf2
 train = true
 model = "v0"
 reward = "gate"
-checkpoint = "gate.msgpack"
+checkpoint = ""
 save = "gate.msgpack"
-il_prob = 0.5
+il_prob = 0.0
 
 [sim]
 # Physics options:
