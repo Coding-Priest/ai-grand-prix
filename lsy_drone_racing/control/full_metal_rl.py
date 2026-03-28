@@ -32,6 +32,7 @@ class FullMetalRL(Controller):
         self.agent = self.model.Agent(self.train, 19, alpha=0.01, gamma=0.99, ckpt=_ckpt)
         self.save = Path(__file__).parent.parent / ".ckpt" / config.rl.save
         self.ep = 0
+        self.action = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
         # immitation learning
         self.il = False
@@ -113,7 +114,7 @@ class FullMetalRL(Controller):
 
         action = np.concatenate([euler_desired, [thrust_desired]], dtype=np.float32)
 
-        return action
+        return action - self.action
 
     def compute_control(
             self, 
@@ -167,12 +168,12 @@ class FullMetalRL(Controller):
         ]], dtype=np.float32) # shape = (1, 19)
 
         if self.il:
-            iact = self.il_control(obs, info)
-            act, _ = self.agent.forward(statev, iact)
+            idact = self.il_control(obs, info)
+            dact, _ = self.agent.forward(statev, idact)
         else:
-            act, confidence = self.agent.forward(statev)
-        print(act)
-        return act
+            dact, confidence = self.agent.forward(statev)
+        self.action += dact
+        return self.action
 
     def step_callback(
             self,
