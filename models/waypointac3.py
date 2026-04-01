@@ -5,7 +5,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 
-class WaypointActorCritic(nn.Module):
+class WaypointActorCritic3(nn.Module):
     def __init__(self, window_size=3, hidden_layers=[256, 256], std_init=-0.5):
         """
         Args:
@@ -13,13 +13,13 @@ class WaypointActorCritic(nn.Module):
             hidden_layers: List defining the size of the hidden layers.
             std_init: Initial value for the log standard deviation of the actions.
         """
-        super(WaypointActorCritic, self).__init__()
+        super(WaypointActorCritic3, self).__init__()
 
         self.window_size = window_size
 
         # --- Calculate Input Dimension ---
-        # Quat(4) + Vel(3) + AngVel(3) + [Pos(3) + Quat(4)] * window_size
-        self.state_dim = 4 + 3 + 3 + (3 * self.window_size) + (4 * self.window_size)
+        # Gravity(3) + Vel(3) + AngVel(3) + [Pos(3) + Forward(3) + Up(3)] * window_size
+        self.state_dim = 3 + 3 + 3 + (9 * self.window_size)
         self.action_dim = 4  # Roll, Pitch, Yaw, Thrust
 
         # --- Build Actor Network ---
@@ -27,7 +27,7 @@ class WaypointActorCritic(nn.Module):
         in_dim = self.state_dim
         for h_dim in hidden_layers:
             actor_layers.append(nn.Linear(in_dim, h_dim))
-            actor_layers.append(nn.ReLU())  # Mish or Tanh also work well here
+            actor_layers.append(nn.ReLU())
             in_dim = h_dim
 
         actor_layers.append(nn.Linear(in_dim, self.action_dim))
@@ -75,15 +75,8 @@ class WaypointActorCritic(nn.Module):
         target_gate_idx,
         gates_pos,
         gates_quat,
-        use_pass_through=False,  # <-- NEW VARIABLE
+        use_pass_through=False,
     ):
-        """
-        Extracts a sliding window of the next N waypoints, converts them to the
-        ego-centric frame, applies goal duplication if necessary, and stacks the batch.
-        """
-        from scipy.spatial.transform import Rotation as R  # Ensure R is imported
-
-        # Ensure inputs are numpy arrays
         drone_pos = np.array(drone_pos)
         drone_quat = np.array(drone_quat)
         vel = np.array(vel)
@@ -92,11 +85,9 @@ class WaypointActorCritic(nn.Module):
         gates_pos = np.array(gates_pos)
         gates_quat = np.array(gates_quat)
 
-        # 1. Detect if we are receiving a batch (Training) or a single state (Validation)
         is_batched = drone_pos.ndim > 1
         batch_size = drone_pos.shape[0] if is_batched else 1
 
-        # Add a temporary batch dimension to single environments so the loop works universally
         if not is_batched:
             drone_pos = np.expand_dims(drone_pos, axis=0)
             drone_quat = np.expand_dims(drone_quat, axis=0)
@@ -104,55 +95,49 @@ class WaypointActorCritic(nn.Module):
             ang_vel = np.expand_dims(ang_vel, axis=0)
             target_gate_idx = np.expand_dims(target_gate_idx, axis=0)
 
-        # Handle gates (VecEnv usually duplicates the static track for each env, making it 3D)
         has_batched_gates = gates_pos.ndim == 3
-
         processed_states = []
 
-        # 2. Iterate through the batch and apply your ego-centric math
+        # Base vectors for 6-DoF orientation
+        base_forward = np.array([1.0, 0.0, 0.0])
+        base_up = np.array([0.0, 0.0, 1.0])
+        global_gravity = np.array([0.0, 0.0, -1.0])
+
         for i in range(batch_size):
             d_pos = drone_pos[i]
             d_quat = drone_quat[i]
             v = vel[i]
             a_vel = ang_vel[i]
-
-            # Safely extract the target index for THIS specific drone
             t_idx = int(target_gate_idx[i].item())
 
             g_pos = gates_pos[i] if has_batched_gates else gates_pos
             g_quat = gates_quat[i] if has_batched_gates else gates_quat
 
-            # --- Extract the Lookahead Window ---
+            # --- Lookahead Extraction & Final Gate Logic ---
             total_gates = len(g_pos)
+            is_final_gate = 0.0
 
             if t_idx == -1:
-                t_idx = total_gates - 1  # Use the final gate if the race is over
+                t_idx = total_gates - 1
+                is_final_gate = 1.0
 
             end_idx = min(t_idx + self.window_size, total_gates)
             lookahead_pos = list(g_pos[t_idx:end_idx])
             lookahead_quat = list(g_quat[t_idx:end_idx])
 
-            # Goal Duplication / Ghost Gate Padding
+            # --- Ghost Gate Padding ---
             while len(lookahead_pos) < self.window_size:
                 if use_pass_through:
-                    # --- Create Ghost Gates ---
                     last_pos = np.array(lookahead_pos[-1])
                     last_quat = np.array(lookahead_quat[-1])
 
-                    # Get the rotation matrix of the last gate
                     gate_rot = R.from_quat(last_quat)
+                    forward_vec = gate_rot.apply(base_forward)
 
-                    # The local forward axis of your gates is +X [1.0, 0.0, 0.0]
-                    # Apply the rotation to find the world-frame forward vector
-                    forward_vec = gate_rot.apply(np.array([1.0, 0.0, 0.0]))
-
-                    # Project the ghost gate 2.0 meters forward (adjustable)
                     ghost_pos = last_pos + (forward_vec * 2.0)
-
                     lookahead_pos.append(ghost_pos)
-                    lookahead_quat.append(last_quat)  # Maintain the same orientation
+                    lookahead_quat.append(last_quat)
                 else:
-                    # --- Original Hover Padding ---
                     lookahead_pos.append(lookahead_pos[-1])
                     lookahead_quat.append(lookahead_quat[-1])
 
@@ -163,32 +148,49 @@ class WaypointActorCritic(nn.Module):
             r_drone = R.from_quat(d_quat)
             r_drone_inv = r_drone.inv()
 
-            # Translate and Rotate Positions
+            # 1. Gravity to Ego Frame
+            ego_gravity = r_drone_inv.apply(global_gravity)
+
+            # 2. Velocities to Ego Frame
+            ego_vel = r_drone_inv.apply(v)
+            ego_ang_vel = r_drone_inv.apply(a_vel)
+
+            # 3. Gates to Ego Frame
             rel_pos = lookahead_pos - d_pos
             ego_gates_pos = r_drone_inv.apply(rel_pos)
 
-            # Rotate Quaternions
+            # 4. Gate Quaternions to 6-DoF (Forward & Up Vectors)
             r_gates = R.from_quat(lookahead_quat)
             r_ego_gates = r_drone_inv * r_gates
-            ego_gates_quat = r_ego_gates.as_quat()
 
-            # --- Tensor Conversion & Normalization ---
-            t_drone_quat = torch.as_tensor(d_quat, dtype=torch.float32)
-            t_vel = torch.as_tensor(v, dtype=torch.float32) / 10.0
-            t_ang_vel = torch.as_tensor(a_vel, dtype=torch.float32) / 10.0
+            ego_gates_forward = r_ego_gates.apply(base_forward)
+            ego_gates_up = r_ego_gates.apply(base_up)
+
+            # --- Tensor Conversion ---
+            t_gravity = torch.as_tensor(ego_gravity, dtype=torch.float32)
+            t_vel = torch.as_tensor(ego_vel, dtype=torch.float32) / 10.0
+            t_ang_vel = torch.as_tensor(ego_ang_vel, dtype=torch.float32) / 10.0
 
             t_gates_pos = (
                 torch.as_tensor(ego_gates_pos, dtype=torch.float32).flatten() / 10.0
             )
-            t_gates_quat = torch.as_tensor(
-                ego_gates_quat, dtype=torch.float32
+            t_gates_forward = torch.as_tensor(
+                ego_gates_forward, dtype=torch.float32
             ).flatten()
+            t_gates_up = torch.as_tensor(ego_gates_up, dtype=torch.float32).flatten()
 
-            # --- Final Concatenation ---
+            t_is_final = torch.tensor([is_final_gate], dtype=torch.float32)
+
             state = torch.cat(
-                [t_drone_quat, t_vel, t_ang_vel, t_gates_pos, t_gates_quat]
+                [
+                    t_gravity,
+                    t_vel,
+                    t_ang_vel,
+                    t_gates_pos,
+                    t_gates_forward,
+                    t_gates_up,
+                ]
             )
             processed_states.append(state)
 
-        # 3. Stack all environments into a final batched tensor
         return torch.stack(processed_states, dim=0)

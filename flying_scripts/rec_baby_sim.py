@@ -24,9 +24,9 @@ from mpl_toolkits.mplot3d import Axes3D
 import numpy as np
 
 from lsy_drone_racing.utils import load_config, load_controller
-from .visualize import VisualizeSim
+from visualize.visualize_ego import VisualizeEgoSim
 from .rollout_buffer import RolloutBuffer
-from models.droneac import DroneActorCritic
+from models.waypointac3 import WaypointActorCritic3
 
 
 if TYPE_CHECKING:
@@ -38,13 +38,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# sim_visualizer = VisualizeSim()
+# sim_visualizer = VisualizeEgoSim(window_size=3)
+
+dummy_model = WaypointActorCritic3()
 
 
 def simulate(
     config: str = "level0_baby_steps.toml",
     controller: str | None = None,
-    n_runs: int = 1,
+    n_runs: int = 100,
     render: bool | None = None,
 ) -> list[float]:
     """Evaluate the drone controller over multiple episodes.
@@ -81,12 +83,17 @@ def simulate(
         track=config.env.track,
         disturbances=config.env.get("disturbances"),
         randomizations=config.env.get("randomizations"),
+        max_episode_steps=2350,
         seed=config.env.seed,
-        disable_termination=True,
-        disable_collisions=True,
+        disable_termination=False,
+        disable_collisions=False,
+        device="gpu",
     )
 
     env = JaxToNumpy(env)
+
+    expert_states = []
+    expert_actions = []
 
     ep_times = []
     for _ in range(n_runs):  # Run n_runs episodes with the controller
@@ -99,16 +106,29 @@ def simulate(
             curr_time = i / config.env.freq
 
             action = controller.compute_control(obs, info)
+            action = np.asarray(jp.asarray(action), copy=True)
+            formatted_state = dummy_model.format_state(
+                obs["pos"],
+                obs["quat"],
+                obs["vel"],
+                obs["ang_vel"],
+                obs["target_gate"],
+                obs["gates_pos"],
+                obs["gates_quat"],
+                use_pass_through=True,
+            )
 
             action = np.asarray(jp.asarray(action), copy=True)
+            expert_states.append(formatted_state.squeeze(0).numpy())
+            expert_actions.append(action)
 
             obs, reward, terminated, truncated, info = env.step(action)
 
-            if terminated:
-                print("Terminated from source")
-
-            if reward > 0:
-                print("Reward: ", reward * 100)
+            # if terminated:
+            #     print("Terminated from source")
+            # if reward * 100 > 1:
+            # print("Reward: ", reward * 100)
+            # print("POS:", obs["pos"])
 
             # Update the controller internal state and models.
             controller_finished = controller.step_callback(
@@ -123,7 +143,17 @@ def simulate(
             if config.sim.render:  # Render the sim if selected.
                 if ((i * fps) % config.env.freq) < fps:
                     env.render()
-                    # sim_visualizer.plot_obs(obs)
+                    formatted_state = dummy_model.format_state(
+                        obs["pos"],
+                        obs["quat"],
+                        obs["vel"],
+                        obs["ang_vel"],
+                        obs["target_gate"],
+                        obs["gates_pos"],
+                        obs["gates_quat"],
+                        use_pass_through=True,
+                    )
+                    # sim_visualizer.plot_obs(obs, formatted_state_tensor=formatted_state)
 
             i += 1
 
@@ -134,6 +164,16 @@ def simulate(
 
     # Close the environment
     env.close()
+
+    # --- NEW: Save the dataset to disk ---
+    print(f"Saving {len(expert_states)} transitions to expert_data.npz...")
+    np.savez(
+        "bootstrap_data_curriculum1.npz",
+        states=np.array(expert_states, dtype=np.float32),
+        actions=np.array(expert_actions, dtype=np.float32),
+    )
+    print("Save complete!")
+
     return ep_times
 
 

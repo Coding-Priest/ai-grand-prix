@@ -56,15 +56,15 @@ class KeyboardController(Controller):
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
         """Initialize the HUD keyboard controller."""
         super().__init__(obs, info, config)
-        print("╔══════════════════════════════════════════╗")
-        print("║   HUD Keyboard Controller Initialized    ║")
-        print("╠══════════════════════════════════════════╣")
-        print("║  W/S      = Pitch forward/backward       ║")
-        print("║  A/D      = Yaw left/right                ║")
-        print("║  ↑/↓      = Increase/decrease height      ║")
-        print("║  R        = Level out                     ║")
-        print("║  Esc      = Quit                          ║")
-        print("╚══════════════════════════════════════════╝")
+        # print("╔══════════════════════════════════════════╗")
+        # print("║   HUD Keyboard Controller Initialized    ║")
+        # print("╠══════════════════════════════════════════╣")
+        # print("║  W/S      = Pitch forward/backward       ║")
+        # print("║  A/D      = Yaw left/right                ║")
+        # print("║  ↑/↓      = Increase/decrease height      ║")
+        # print("║  R        = Level out                     ║")
+        # print("║  Esc      = Quit                          ║")
+        # print("╚══════════════════════════════════════════╝")
         self._freq = config.env.freq
 
         drone_params = load_params(config.sim.physics, config.sim.drone_model)
@@ -91,7 +91,9 @@ class KeyboardController(Controller):
         # Control sensitivities
         self.pitch_sens = 0.02
         self.yaw_sens = 0.03
-        self.pitch_decay = 0.85  # pitch springs back to 0 each frame (lower = faster return)
+        self.pitch_decay = (
+            0.85  # pitch springs back to 0 each frame (lower = faster return)
+        )
 
         # Limits
         self.max_pitch = math.pi / 4

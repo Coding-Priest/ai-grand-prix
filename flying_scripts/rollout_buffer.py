@@ -69,12 +69,12 @@ class RolloutBuffer:
                 "RolloutBuffer is full. Call compute_returns_and_advantages() and train before adding more."
             )
 
-        self.observations[self.step] = obs.clone().detach()
-        self.actions[self.step] = action.clone().detach()
-        self.rewards[self.step] = reward.clone().detach()
-        self.values[self.step] = value.clone().detach().squeeze(-1)
-        self.log_probs[self.step] = log_prob.clone().detach().squeeze(-1)
-        self.dones[self.step] = done.clone().detach()
+        self.observations[self.step] = obs.detach()
+        self.actions[self.step] = action.detach()
+        self.rewards[self.step] = reward.detach()
+        self.values[self.step] = value.detach().squeeze(-1)
+        self.log_probs[self.step] = log_prob.detach().squeeze(-1)
+        self.dones[self.step] = done.detach()
 
         self.step += 1
         if self.step == self.num_steps:
@@ -133,9 +133,9 @@ class RolloutBuffer:
         flat_returns = self.returns.view(flat_size)
 
         # Normalize advantages (Standard practice to stabilize training)
-        flat_advantages = (flat_advantages - flat_advantages.mean()) / (
-            flat_advantages.std() + 1e-8
-        )
+        # flat_advantages = (flat_advantages - flat_advantages.mean()) / (
+        #     flat_advantages.std() + 1e-8
+        # )
 
         # Create a random sampler to shuffle the data
         sampler = BatchSampler(
@@ -143,6 +143,10 @@ class RolloutBuffer:
         )
 
         for indices in sampler:
+            mb_advantages = flat_advantages[indices]
+            mb_advantages = (mb_advantages - mb_advantages.mean()) / (
+                mb_advantages.std(unbiased=False) + 1e-8
+            )
             yield (
                 flat_obs[indices],
                 flat_actions[indices],

@@ -42,17 +42,56 @@ class AttitudeController(Controller):
         drone_params = load_params(config.sim.physics, config.sim.drone_model)
         self.drone_mass = drone_params["mass"]  # alternatively from sim.drone_mass
 
-        self.kp = np.array([0.4, 0.4, 1.25])
+        self.kp = np.array([0.5, 0.5, 1.25])
         self.ki = np.array([0.05, 0.05, 0.05])
         self.kd = np.array([0.2, 0.2, 0.4])
         self.ki_range = np.array([2.0, 2.0, 0.4])
         self.i_error = np.zeros(3)
         self.g = 9.81
         # print(obs.keys())
-        baby_waypoints = np.array([obs["pos"], [0, 0, 0.7]])
-        baby_waypoints_2 = np.array([obs["pos"], [0, 0, 0.7], [-1.0, -0.25, 0.7]])
+
+        auto_pilot_waypoints = np.array(
+            [
+                obs["pos"],
+                [-3.0, 0.0, 0.3],
+                [-2.0, 0.5, 0.6],
+                [-1.0, 1.0, 0.3],
+                [-0.0, 0.5, 0.6],
+                [1.0, 0.0, 0.55],
+                [2.0, -0.5, 0.75],
+                [3.00, -1.0, 0.35],
+                [4.5, -0.5, 0.76],
+            ]
+        )
+
+        baby_waypoints = np.array(
+            [
+                obs["pos"],
+                [-0.0, 0.0, 0.7],
+                [2.0, 0.10, 0.6],
+                [2.5, 0.1, 0.6],
+                [4.0, 0.4, 0.4],
+                [5.0, 0.8, 0.4],
+                # [-3.0, 0.0, 0.7],
+                # [-3.0, 0.0, 0.7],
+            ]
+        )
+        baby_waypoints_2 = np.array(
+            [
+                obs["pos"],
+                [-3.0, 0.0, 0.7],
+                [-2.0, 0.0, 0.7],
+                [-1.0, 0.0, 0.7],
+                [-0.0, 0.0, 0.7],
+                [1.0, 0.0, 0.7],
+                [2.0, 0.0, 0.7],
+                [3.00, 0.0, 0.7],
+                [4.5, 0.0, 0.7],
+            ]
+        )
+
         # Same waypoints as in the position controller. Determined by trial and error.
-        waypoints = baby_waypoints
+        waypoints = auto_pilot_waypoints  # baby_waypoints_2  # auto_pilot_waypoints
         # np.array(
         # [
         #     [-1.5, 0.75, 0.05],
@@ -67,7 +106,7 @@ class AttitudeController(Controller):
         # [0.5, -0.75, 1.2],
         # ]
         # )
-        self._t_total = 5  # 15s
+        self._t_total = 4  # 10  # 3  # 15s
         t = np.linspace(0, self._t_total, len(waypoints))
         self._des_pos_spline = CubicSpline(t, waypoints)
         self._des_vel_spline = self._des_pos_spline.derivative()

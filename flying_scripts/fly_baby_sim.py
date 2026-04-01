@@ -24,9 +24,9 @@ from mpl_toolkits.mplot3d import Axes3D
 import numpy as np
 
 from lsy_drone_racing.utils import load_config, load_controller
-from .visualize import VisualizeSim
+from visualize.visualize_ego3 import VisualizeEgoSimV3
 from .rollout_buffer import RolloutBuffer
-from models.droneac import DroneActorCritic
+from models.waypointac3 import WaypointActorCritic3
 
 
 if TYPE_CHECKING:
@@ -38,11 +38,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# sim_visualizer = VisualizeSim()
+sim_visualizer = VisualizeEgoSimV3(window_size=3)
+
+dummy_model = WaypointActorCritic3()
 
 
 def simulate(
-    config: str = "level0_baby_steps.toml",
+    config: str = "level0_boot_strap.toml",
     controller: str | None = None,
     n_runs: int = 1,
     render: bool | None = None,
@@ -81,10 +83,11 @@ def simulate(
         track=config.env.track,
         disturbances=config.env.get("disturbances"),
         randomizations=config.env.get("randomizations"),
-        max_episode_steps=350,
+        max_episode_steps=2350,
         seed=config.env.seed,
         disable_termination=False,
         disable_collisions=False,
+        device="gpu",
     )
 
     env = JaxToNumpy(env)
@@ -105,12 +108,11 @@ def simulate(
 
             obs, reward, terminated, truncated, info = env.step(action)
 
-            if terminated:
-                print("Terminated from source")
-
-            # if reward > 0:
+            # if terminated:
+            #     print("Terminated from source")
+            # if reward * 100 > 1:
             print("Reward: ", reward * 100)
-            # print("Target Gate:", obs["target_gate"])
+            # print("POS:", obs["pos"])
 
             # Update the controller internal state and models.
             controller_finished = controller.step_callback(
@@ -125,7 +127,17 @@ def simulate(
             if config.sim.render:  # Render the sim if selected.
                 if ((i * fps) % config.env.freq) < fps:
                     env.render()
-                    # sim_visualizer.plot_obs(obs)
+                    formatted_state = dummy_model.format_state(
+                        obs["pos"],
+                        obs["quat"],
+                        obs["vel"],
+                        obs["ang_vel"],
+                        obs["target_gate"],
+                        obs["gates_pos"],
+                        obs["gates_quat"],
+                        use_pass_through=True,
+                    )
+                    sim_visualizer.plot_obs(obs, formatted_state_tensor=formatted_state)
 
             i += 1
 

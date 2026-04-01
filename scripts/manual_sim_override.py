@@ -90,6 +90,11 @@ def simulate(
 
             obs, reward, terminated, truncated, info = env.step(action)
 
+            reward = reward * 100
+
+            if reward > 1 or reward < -1:
+                print(reward)
+
             # What is even the point of this?
             # Update the controller internal state and models.
             controller_finished = controller.step_callback(
