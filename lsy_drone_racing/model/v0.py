@@ -25,11 +25,15 @@ class Policy(nn.Module):
         h = nn.leaky_relu(nn.Dense(features=256)(v), negative_slope=self.nslope)
         h = nn.leaky_relu(nn.Dense(features=256)(h), negative_slope=self.nslope)
         h = nn.leaky_relu(nn.Dense(features=256)(h), negative_slope=self.nslope)
+        h = nn.leaky_relu(nn.Dense(features=256)(h), negative_slope=self.nslope)
+        h = nn.leaky_relu(nn.Dense(features=256)(h), negative_slope=self.nslope)
         
         m   = nn.leaky_relu(nn.Dense(features=256)(h), negative_slope=self.nslope)
+        m   = nn.leaky_relu(nn.Dense(features=256)(m), negative_slope=self.nslope)
         mu  = nn.tanh(nn.Dense(features=4)(m))
 
         s   = nn.leaky_relu(nn.Dense(features=256)(h), negative_slope=self.nslope)
+        s   = nn.leaky_relu(nn.Dense(features=256)(s), negative_slope=self.nslope)
         std = nn.softplus(nn.Dense(features=4)(s)) + EPSILON
 
         return mu, std

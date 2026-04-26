@@ -18,11 +18,29 @@ from drone_models.core import load_params
 from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R
 
+import lsy_drone_racing.utils as utils
 from lsy_drone_racing.control import Controller
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
+class Buffer:
+    def __init__(self):
+        self.obs = []
+        self.act = []
+
+    def consume(self, act, obs):
+        self.act.append(act)
+        self.obs.append(obs)
+
+    def save(self, file):
+
+        obs_arr = np.array(self.obs)
+        act_arr = np.array(self.act)
+        np.savez_compressed(file, obs=obs_arr, act=act_arr)
+
+        self.obs = []
+        self.act = []
 
 class AttitudeController(Controller):
     """Example of a controller using the collective thrust and attitude interface."""
@@ -38,6 +56,8 @@ class AttitudeController(Controller):
         """
         super().__init__(obs, info, config)
         self._freq = config.env.freq
+
+        self.buffer = Buffer()
 
         drone_params = load_params(config.sim.physics, config.sim.drone_model)
         self.drone_mass = drone_params["mass"]  # alternatively from sim.drone_mass
@@ -72,9 +92,10 @@ class AttitudeController(Controller):
         self._tick = 0
         self._finished = False
 
+        self.episode_n = 0
+
     def compute_control(
-        self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
-    ) -> NDArray[np.floating]:
+            self, obs: dict[str, NDArray[np.floating]], info: dict | None = None) -> NDArray[np.floating]:
         """Compute the next desired collective thrust and roll/pitch/yaw of the drone.
 
         Args:
@@ -130,19 +151,44 @@ class AttitudeController(Controller):
         return action
 
     def step_callback(
-        self,
-        action: NDArray[np.floating],
-        obs: dict[str, NDArray[np.floating]],
-        reward: float,
-        terminated: bool,
-        truncated: bool,
-        info: dict,
-    ) -> bool:
+            self, action: NDArray[np.floating],
+            obs: dict[str, NDArray[np.floating]],
+            reward: float, terminated: bool,
+            truncated: bool, info: dict
+        ) -> bool:
         """Increment the tick counter.
 
         Returns:
             True if the controller is finished, False otherwise.
         """
+        x,  y,  z  = obs["pos"]
+        r,  p,  ya = utils.tr.quat2rpy(*obs["quat"])
+        vx, vy, vz = obs["vel"]
+        wx, wy, wz = obs["ang_vel"]
+
+        # external state
+        _i = obs["target_gate"]
+
+        gx, gy, gz  = obs["gates_pos"][_i]
+        gr, gp, gya = utils.tr.quat2rpy(*obs["gates_quat"][_i])
+        del _i, gr, gp
+
+        _dp  = np.array([x, y, z])
+        _obp = np.array(obs["obstacles_pos"])
+        _ds  = np.sum((_obp - _dp)**2, axis=1)        
+        _o   = int(np.argmin(_ds))
+
+        ox, oy, oz = obs["obstacles_pos"][_o]
+        del _dp, _obp, _ds, _o
+
+        statev = np.array([[
+            x,  y,  z,  r,  p,  ya,
+            vx, vy, vz, wx, wy, wz,
+            gx, gy, gz, gya,
+            ox, oy, oz
+        ]], dtype=np.float32) # shape = (1, 19)
+
+        self.buffer.consume(action, statev)
         self._tick += 1
         return self._finished
 
@@ -150,3 +196,5 @@ class AttitudeController(Controller):
         """Reset the internal state."""
         self.i_error[:] = 0
         self._tick = 0
+        self.buffer.save(f"episode{self.episode_n}.npz")
+        self.episode_n += 1
